@@ -39,6 +39,7 @@ sudo mv awsh /usr/local/bin/
 
 ```
 awsh [options]
+awsh --status [--region REGION]
 awsh --terminate [--region REGION]
 ```
 
@@ -53,6 +54,7 @@ awsh --terminate [--region REGION]
 | `--user-data` | Bootstrap script (file path or inline) | — |
 | `--region` | AWS region override | CLI default |
 | `--no-ssh` | Print SSH command instead of connecting | — |
+| `--status` | Show all awsh-created resources | — |
 | `--terminate` | Terminate all awsh instances & clean up | — |
 | `--dry-run` | Preview without executing | — |
 
@@ -89,6 +91,9 @@ apt update && apt install -y nmap nikto'
 
 # Just create it, don't SSH
 awsh --no-ssh
+
+# See what's running
+awsh --status
 
 # Clean up everything
 awsh --terminate
