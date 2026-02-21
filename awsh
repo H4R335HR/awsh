@@ -7,6 +7,7 @@
 set -euo pipefail
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
+AWSH_DIR="$HOME/.cache/awsh"
 DEFAULT_IMAGE="ubuntu"
 DEFAULT_TYPE="t3.micro"
 DEFAULT_KEY_NAME="awsh-key"
@@ -184,7 +185,7 @@ cleanup() {
         if [[ "$CREATED_KEY" == true ]]; then
             aws ec2 delete-key-pair "${REGION_FLAG[@]}" \
                 --key-name "$KEY_NAME" &>/dev/null || true
-            rm -f "${KEY_NAME}.pem"
+            rm -f "${AWSH_DIR}/${KEY_NAME}.pem"
             info "Deleted key pair $KEY_NAME"
         fi
     fi
@@ -282,7 +283,7 @@ status_awsh() {
             [[ -z "$kn" ]] && continue
             key_count=$((key_count + 1))
             local pem_status="${RED}missing${NC}"
-            [[ -f "${kn}.pem" ]] && pem_status="${GREEN}present${NC}"
+            [[ -f "${AWSH_DIR}/${kn}.pem" ]] && pem_status="${GREEN}present${NC}"
             echo -e "  ${CYAN}$kn${NC}  (local .pem: $pem_status)" >&2
         done <<< "$key_lines"
         echo -e "  ${BOLD}Total: $key_count key pair(s)${NC}" >&2
@@ -399,7 +400,7 @@ terminate_awsh() {
         for kn in $key_names; do
             info "Deleting key pair: $kn"
             aws ec2 delete-key-pair "${REGION_FLAG[@]}" --key-name "$kn" &>/dev/null
-            rm -f "${kn}.pem"
+            rm -f "${AWSH_DIR}/${kn}.pem"
             success "Deleted: $kn (+ local .pem)"
         done
     else
@@ -441,7 +442,8 @@ preflight() {
 
 # ─── Key pair management ────────────────────────────────────────────────────
 setup_key() {
-    local key_file="${KEY_NAME}.pem"
+    mkdir -p "$AWSH_DIR"
+    local key_file="${AWSH_DIR}/${KEY_NAME}.pem"
 
     # Check if key pair exists in AWS
     if aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
@@ -600,7 +602,7 @@ launch_instance() {
 # ─── Wait for SSH ────────────────────────────────────────────────────────────
 wait_for_ssh() {
     local ip="$1"
-    local key_file="${KEY_NAME}.pem"
+    local key_file="${AWSH_DIR}/${KEY_NAME}.pem"
     local user="$2"
     local max_attempts=30
     local attempt=0
@@ -628,7 +630,7 @@ print_summary() {
     local instance_id="$1"
     local public_ip="$2"
     local user="$3"
-    local key_file="${KEY_NAME}.pem"
+    local key_file="${AWSH_DIR}/${KEY_NAME}.pem"
 
     echo
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -747,12 +749,12 @@ main() {
         echo
         exec ssh -o StrictHostKeyChecking=no \
                  -o UserKnownHostsFile=/dev/null \
-                 -i "${KEY_NAME}.pem" \
+                 -i "${AWSH_DIR}/${KEY_NAME}.pem" \
                  "${SSH_USER}@${public_ip}"
     else
         echo
         warn "SSH not ready after retries. Instance may still be initializing."
-        info "Try manually: ssh -i ${KEY_NAME}.pem ${SSH_USER}@${public_ip}"
+        info "Try manually: ssh -i ${AWSH_DIR}/${KEY_NAME}.pem ${SSH_USER}@${public_ip}"
         exit 1
     fi
 }
