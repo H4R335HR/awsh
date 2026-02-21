@@ -18,6 +18,15 @@ Built for cybersecurity students and anyone who needs a quick throwaway box with
 
 Everything is tagged `CreatedBy=awsh` so you can clean up with `awsh --terminate`.
 
+## Requirements
+
+- **Linux** (any distro) or **macOS** — this is a Bash script, not tested on Windows
+- **AWS CLI v2** — [install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+- **curl** — for public IP detection via `checkip.amazonaws.com`
+- **ssh** — OpenSSH client
+
+The script checks for all required dependencies at startup and exits with a clear error if anything is missing.
+
 ## Install
 
 ```bash
@@ -25,8 +34,6 @@ curl -sL https://raw.githubusercontent.com/H4R335HR/awsh/main/awsh -o awsh
 chmod +x awsh
 sudo mv awsh /usr/local/bin/
 ```
-
-Requires: `aws` CLI v2, `curl`, `ssh` in Linux Distro
 
 ## Usage
 
@@ -98,11 +105,11 @@ awsh --terminate
 
 ## Notes
 
-- SSH is always opened for your public IP (auto-detected via `ifconfig.me`). Override with `--ip`.
+- Your public IP is auto-detected via `checkip.amazonaws.com`. Override with `--ip`.
 - The SSH user is auto-resolved from the image (`ubuntu`, `ec2-user`, `admin`).
 - If the key pair exists in AWS and the local `.pem` is present, it's reused. If the `.pem` is missing, the key is recreated.
 - If anything fails mid-launch, the script automatically cleans up the instance, security group, and key pair it created.
 
 ## License
 
-MIT
+[MIT](https://github.com/H4R335HR/awsh/blob/main/LICENSE)
