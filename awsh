@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# awsh - AWS EC2 Quick Launch & SSH
+# awsh - AWS EC2 Quick Launch & SSH/RDP
 # Usage: awsh [-i image] [-p ports] [-t type] [-n name] [-k keyname]
-#              [--ip cidr] [--no-ssh] [--user-data file/script]
+#              [--ip cidr] [--no-ssh] [--no-rdp] [--user-data file/script]
 #              [--region region] [--dry-run] [--terminate] [-h]
 
 set -euo pipefail
@@ -16,8 +16,10 @@ DEFAULT_REGION=""
 EXTRA_PORTS=""
 CUSTOM_IP=""
 NO_SSH=false
+NO_RDP=false
 DRY_RUN=false
 SSH_USER=""
+IS_WINDOWS=false
 CLEANUP_ON_FAIL=true
 TERMINATE_MODE=false
 STATUS_MODE=false
@@ -41,7 +43,7 @@ die()     { error "$*"; exit 1; }
 usage() {
     cat <<'EOF'
 
-  awsh - AWS EC2 Quick Launch & SSH
+  awsh - AWS EC2 Quick Launch & SSH/RDP
 
   USAGE
     awsh [options]
@@ -50,7 +52,8 @@ usage() {
 
   OPTIONS
     -i, --image IMAGE       AMI alias or full AMI ID (default: ubuntu)
-                            Aliases: amazon-linux, ubuntu, debian, rhel, suse
+                            Linux:   amazon-linux, ubuntu, debian, rhel, suse
+                            Windows: windows (2016), win2019, win2022
     -t, --type TYPE         Instance type (default: t3.micro)
     -p, --ports PORTS       Comma-separated extra ports to open (e.g. 80,443)
     -n, --name NAME         Instance Name tag (default: awsh-instance)
@@ -61,7 +64,8 @@ usage() {
                             • A file path (e.g. ./setup.sh or /path/to/cloud-init.yaml)
                             • An inline script string (e.g. '#!/bin/bash\napt update')
         --region REGION     AWS region override
-        --no-ssh            Don't SSH; just print the SSH command
+        --no-ssh            Don't SSH; just print the SSH command (Linux)
+        --no-rdp            Don't RDP; just print connection info (Windows)
         --status            Show all awsh-created resources
         --terminate         Terminate all awsh-created instances & clean up
         --dry-run           Show what would be done without executing
@@ -72,6 +76,9 @@ usage() {
     awsh -i amazon-linux            # Amazon Linux, t3.micro, SSH
     awsh -i ubuntu -p 80,443        # Ubuntu + open ports 80 & 443
     awsh -i ubuntu -t t3.small      # Ubuntu on t3.small
+    awsh -i windows                 # Windows Server 2016, RDP via xfreerdp3
+    awsh -i win2022 -p 80,443       # Windows Server 2022 + extra ports
+    awsh -i windows --no-rdp        # Create Windows instance, print RDP info
     awsh -i ami-0abcdef1234567890   # Custom AMI ID
     awsh --no-ssh -n my-server      # Create & print SSH command only
     awsh --ip 10.0.0.0/8 -p 8080   # Custom ingress CIDR
@@ -102,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --region)      DEFAULT_REGION="$2"; shift 2 ;;
         --user-data)   USER_DATA="$2";     shift 2 ;;
         --no-ssh)      NO_SSH=true;        shift ;;
+        --no-rdp)      NO_RDP=true;        shift ;;
         --dry-run)     DRY_RUN=true;       shift ;;
         --status)      STATUS_MODE=true;   shift ;;
         --terminate)   TERMINATE_MODE=true; shift ;;
@@ -140,8 +148,23 @@ resolve_ami() {
             echo "RHEL_LOOKUP" ;;
         suse|sles)
             echo "resolve:ssm:/aws/service/suse/sles/15-sp5/x86_64/latest" ;;
+        windows|win2016|windows2016)
+            echo "resolve:ssm:/aws/service/ami-windows-latest/Windows_Server-2016-English-Full-Base" ;;
+        win2019|windows2019)
+            echo "resolve:ssm:/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base" ;;
+        win2022|windows2022)
+            echo "resolve:ssm:/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base" ;;
         *)
-            die "Unknown image alias: $img\nSupported: amazon-linux, ubuntu, ubuntu22, debian, rhel, suse (or pass ami-xxxxx)" ;;
+            die "Unknown image alias: $img\nSupported: amazon-linux, ubuntu, ubuntu22, debian, rhel, suse, windows, win2019, win2022 (or pass ami-xxxxx)" ;;
+    esac
+}
+
+# Detect if image is Windows
+is_windows_image() {
+    local img="$1"
+    case "${img,,}" in
+        windows*|win2016|win2019|win2022) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -158,6 +181,7 @@ resolve_ssh_user() {
         debian*)                     echo "admin" ;;
         rhel*)                       echo "ec2-user" ;;
         suse|sles)                   echo "ec2-user" ;;
+        windows*|win2016|win2019|win2022) echo "Administrator" ;;
         *)                           echo "ec2-user" ;;
     esac
 }
@@ -423,8 +447,13 @@ preflight() {
     # curl (for IP detection)
     command -v curl &>/dev/null || die "curl not found. Needed for IP detection."
 
-    # ssh
-    command -v ssh &>/dev/null || die "ssh not found. Install OpenSSH client first."
+    # Connection tool
+    if [[ "$IS_WINDOWS" == true ]]; then
+        command -v xfreerdp3 &>/dev/null || die "xfreerdp3 not found. Install FreeRDP3 first.\n    e.g. sudo apt install freerdp3-x11"
+        command -v openssl &>/dev/null || die "openssl not found. Needed to decrypt Windows password."
+    else
+        command -v ssh &>/dev/null || die "ssh not found. Install OpenSSH client first."
+    fi
 
     # Validate credentials
     info "Validating AWS credentials..."
@@ -517,11 +546,18 @@ create_security_group() {
 
     info "Ingress CIDR: $my_cidr"
 
-    # Open SSH (port 22)
-    info "Opening port 22 (SSH) for $my_cidr"
-    aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
-        --group-id "$sg_id" \
-        --protocol tcp --port 22 --cidr "$my_cidr" &>/dev/null
+    # Open SSH (port 22) or RDP (port 3389)
+    if [[ "$IS_WINDOWS" == true ]]; then
+        info "Opening port 3389 (RDP) for $my_cidr"
+        aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+            --group-id "$sg_id" \
+            --protocol tcp --port 3389 --cidr "$my_cidr" &>/dev/null
+    else
+        info "Opening port 22 (SSH) for $my_cidr"
+        aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+            --group-id "$sg_id" \
+            --protocol tcp --port 22 --cidr "$my_cidr" &>/dev/null
+    fi
 
     # Open extra ports
     if [[ -n "$EXTRA_PORTS" ]]; then
@@ -625,6 +661,58 @@ wait_for_ssh() {
     return 1
 }
 
+# ─── Wait for Windows password ──────────────────────────────────────────────
+wait_for_password() {
+    local instance_id="$1"
+    local key_file="${AWSH_DIR}/${KEY_NAME}.pem"
+    local max_attempts=40  # ~10 minutes at 15s intervals
+    local attempt=0
+
+    info "Waiting for Windows password (this can take 4-10 minutes)..."
+    while [[ $attempt -lt $max_attempts ]]; do
+        local encrypted
+        encrypted=$(aws ec2 get-password-data "${REGION_FLAG[@]}" \
+            --instance-id "$instance_id" \
+            --query 'PasswordData' --output text 2>/dev/null)
+
+        if [[ -n "$encrypted" && "$encrypted" != "None" && "$encrypted" != "" ]]; then
+            # Decrypt using the private key
+            local password
+            password=$(echo "$encrypted" | base64 -d | \
+                openssl pkeyutl -decrypt -inkey "$key_file" 2>/dev/null) || \
+            password=$(echo "$encrypted" | base64 -d | \
+                openssl rsautl -decrypt -inkey "$key_file" 2>/dev/null) || \
+                die "Failed to decrypt Windows password. Check your .pem key."
+            echo >&2  # newline to clear progress line
+            echo "$password"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+        printf "\r${CYAN}[*]${NC} Attempt %d/%d (password not yet available)..." "$attempt" "$max_attempts" >&2
+        sleep 15
+    done
+    echo >&2
+    return 1
+}
+
+# ─── Generate RDP file ──────────────────────────────────────────────────────
+generate_rdp_file() {
+    local public_ip="$1"
+    local instance_id="$2"
+    local rdp_file="${AWSH_DIR}/${INST_NAME}.rdp"
+
+    cat > "$rdp_file" <<RDPEOF
+full address:s:${public_ip}:3389
+username:s:Administrator
+prompt for credentials:i:0
+administrative session:i:1
+RDPEOF
+
+    success "RDP file saved: $rdp_file"
+    echo "$rdp_file"
+}
+
 # ─── Print summary ──────────────────────────────────────────────────────────
 print_summary() {
     local instance_id="$1"
@@ -640,7 +728,13 @@ print_summary() {
     echo -e "  Public IP   : ${CYAN}$public_ip${NC}"
     echo -e "  Image       : ${CYAN}$IMAGE${NC}"
     echo -e "  Type        : ${CYAN}$INSTANCE_TYPE${NC}"
-    echo -e "  SSH User    : ${CYAN}$user${NC}"
+
+    if [[ "$IS_WINDOWS" == true ]]; then
+        echo -e "  RDP User    : ${CYAN}Administrator${NC}"
+    else
+        echo -e "  SSH User    : ${CYAN}$user${NC}"
+    fi
+
     echo -e "  Key File    : ${CYAN}$key_file${NC}"
     if [[ -n "$EXTRA_PORTS" ]]; then
         echo -e "  Extra Ports : ${CYAN}$EXTRA_PORTS${NC}"
@@ -654,8 +748,18 @@ print_summary() {
     fi
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo
-    echo -e "  ${BOLD}SSH Command:${NC}"
-    echo -e "  ${YELLOW}ssh -o StrictHostKeyChecking=no -i $key_file ${user}@${public_ip}${NC}"
+
+    if [[ "$IS_WINDOWS" == true ]]; then
+        echo -e "  ${BOLD}RDP Command:${NC}"
+        echo -e "  ${YELLOW}xfreerdp3 /v:${public_ip} /u:Administrator /p:<password> /cert:tofu /dynamic-resolution +clipboard${NC}"
+        echo
+        echo -e "  ${BOLD}RDP File:${NC}"
+        echo -e "  ${YELLOW}xfreerdp3 ${AWSH_DIR}/${INST_NAME}.rdp /p:<password>${NC}"
+    else
+        echo -e "  ${BOLD}SSH Command:${NC}"
+        echo -e "  ${YELLOW}ssh -o StrictHostKeyChecking=no -i $key_file ${user}@${public_ip}${NC}"
+    fi
+
     echo
     echo -e "  ${BOLD}Terminate:${NC}"
     echo -e "  ${YELLOW}awsh --terminate${NC}  (all awsh instances)"
@@ -677,10 +781,16 @@ main() {
     fi
 
     echo
-    echo -e "${BOLD}${CYAN}  ╔═══════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}  ║     awsh — EC2 Quick Launch   ║${NC}"
-    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════╝${NC}"
+    echo -e "${BOLD}${CYAN}  ╔═════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}  ║   awsh — EC2 Quick Launch       ║${NC}"
+    echo -e "${BOLD}${CYAN}  ╚═════════════════════════════════╝${NC}"
     echo
+
+    # Detect Windows image
+    if is_windows_image "$IMAGE"; then
+        IS_WINDOWS=true
+        info "Windows image detected — will use RDP (xfreerdp3)"
+    fi
 
     # Resolve SSH user
     SSH_USER=$(resolve_ssh_user "$IMAGE")
@@ -707,9 +817,15 @@ main() {
         echo "  Instance Name: $INST_NAME"
         echo "  Extra Ports:   ${EXTRA_PORTS:-none}"
         echo "  Ingress IP:    ${CUSTOM_IP:-auto-detect}"
-        echo "  SSH User:      $SSH_USER"
+        echo "  Windows:       $IS_WINDOWS"
+        if [[ "$IS_WINDOWS" == true ]]; then
+            echo "  RDP User:      Administrator"
+            echo "  No-RDP:        $NO_RDP"
+        else
+            echo "  SSH User:      $SSH_USER"
+            echo "  No-SSH:        $NO_SSH"
+        fi
         echo "  User Data:     ${USER_DATA:-none}"
-        echo "  No-SSH:        $NO_SSH"
         exit 0
     fi
 
@@ -737,25 +853,68 @@ main() {
 
     print_summary "$instance_id" "$public_ip" "$SSH_USER"
 
-    if [[ "$NO_SSH" == true ]]; then
-        info "Skipping SSH (--no-ssh). Use the command above to connect."
-        exit 0
-    fi
+    if [[ "$IS_WINDOWS" == true ]]; then
+        # ── Windows: RDP flow ──
+        if [[ "$NO_RDP" == true ]]; then
+            info "Skipping RDP (--no-rdp). Retrieving password..."
+            local password
+            if password=$(wait_for_password "$instance_id"); then
+                echo
+                success "Windows password retrieved!"
+                echo -e "  ${BOLD}Password:${NC} ${YELLOW}$password${NC}"
+                echo
+                echo -e "  ${BOLD}Connect with:${NC}"
+                echo -e "  ${YELLOW}xfreerdp3 /v:${public_ip} /u:Administrator /p:'${password}' /cert:tofu /dynamic-resolution +clipboard${NC}"
+                echo -e "  ${YELLOW}xfreerdp3 ${AWSH_DIR}/${INST_NAME}.rdp /p:'${password}'${NC}"
+                echo
+                generate_rdp_file "$public_ip" "$instance_id" > /dev/null
+            else
+                warn "Password not available yet. Retrieve it later with:"
+                info "aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
+            fi
+            exit 0
+        fi
 
-    # Wait and connect
-    if wait_for_ssh "$public_ip" "$SSH_USER"; then
-        echo
-        success "SSH ready — connecting now..."
-        echo
-        exec ssh -o StrictHostKeyChecking=no \
-                 -o UserKnownHostsFile=/dev/null \
-                 -i "${AWSH_DIR}/${KEY_NAME}.pem" \
-                 "${SSH_USER}@${public_ip}"
+        # Wait for password and connect
+        local password
+        if password=$(wait_for_password "$instance_id"); then
+            echo
+            success "Windows password retrieved!"
+            echo -e "  ${BOLD}Password:${NC} ${YELLOW}$password${NC}"
+            echo
+            generate_rdp_file "$public_ip" "$instance_id" > /dev/null
+            success "RDP ready — connecting now..."
+            echo
+            exec xfreerdp3 /v:"$public_ip" /u:Administrator /p:"$password" \
+                /cert:tofu /dynamic-resolution +clipboard
+        else
+            echo
+            warn "Password not available after retries. Instance may still be initializing."
+            info "Try later: aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
+            exit 1
+        fi
     else
-        echo
-        warn "SSH not ready after retries. Instance may still be initializing."
-        info "Try manually: ssh -i ${AWSH_DIR}/${KEY_NAME}.pem ${SSH_USER}@${public_ip}"
-        exit 1
+        # ── Linux: SSH flow ──
+        if [[ "$NO_SSH" == true ]]; then
+            info "Skipping SSH (--no-ssh). Use the command above to connect."
+            exit 0
+        fi
+
+        # Wait and connect
+        if wait_for_ssh "$public_ip" "$SSH_USER"; then
+            echo
+            success "SSH ready — connecting now..."
+            echo
+            exec ssh -o StrictHostKeyChecking=no \
+                     -o UserKnownHostsFile=/dev/null \
+                     -i "${AWSH_DIR}/${KEY_NAME}.pem" \
+                     "${SSH_USER}@${public_ip}"
+        else
+            echo
+            warn "SSH not ready after retries. Instance may still be initializing."
+            info "Try manually: ssh -i ${AWSH_DIR}/${KEY_NAME}.pem ${SSH_USER}@${public_ip}"
+            exit 1
+        fi
     fi
 }
 
