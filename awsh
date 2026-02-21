@@ -15,6 +15,9 @@ DEFAULT_NAME="awsh-instance"
 DEFAULT_REGION=""
 EXTRA_PORTS=""
 CUSTOM_IP=""
+CUSTOM_VPC=""
+CUSTOM_SUBNET=""
+AUTO_ASSIGN_IP=""
 NO_SSH=false
 NO_RDP=false
 DRY_RUN=false
@@ -60,6 +63,9 @@ usage() {
     -k, --key KEY           Key pair name to create/reuse (default: awsh-key)
         --ip CIDR           Custom ingress IP/CIDR instead of auto-detect
                             (e.g. 203.0.113.50/32 or 10.0.0.0/24)
+        --vpc VPC_ID        VPC to launch in (default: default VPC)
+        --subnet SUBNET_ID  Subnet to launch in (auto-resolves VPC)
+        --auto-assign-ip    Auto-assign public IP (useful for non-default subnets)
         --user-data VALUE   User data for instance bootstrap. Accepts:
                             • A file path (e.g. ./setup.sh or /path/to/cloud-init.yaml)
                             • An inline script string (e.g. '#!/bin/bash\napt update')
@@ -82,6 +88,8 @@ usage() {
     awsh -i ami-0abcdef1234567890   # Custom AMI ID
     awsh --no-ssh -n my-server      # Create & print SSH command only
     awsh --ip 10.0.0.0/8 -p 8080   # Custom ingress CIDR
+    awsh --subnet subnet-abc123     # Launch in a specific subnet
+    awsh --subnet subnet-abc123 --auto-assign-ip  # Subnet + public IP
     awsh --user-data ./setup.sh     # Bootstrap with a script file
     awsh --user-data '#!/bin/bash
       apt update && apt install -y nginx'  # Inline user data
@@ -106,6 +114,10 @@ while [[ $# -gt 0 ]]; do
         -n|--name)     INST_NAME="$2";     shift 2 ;;
         -k|--key)      KEY_NAME="$2";      shift 2 ;;
         --ip)          CUSTOM_IP="$2";     shift 2 ;;
+        --vpc)         CUSTOM_VPC="$2";    shift 2 ;;
+        --subnet)      CUSTOM_SUBNET="$2"; shift 2 ;;
+        --auto-assign-ip) AUTO_ASSIGN_IP=true; shift ;;
+        --no-auto-assign) AUTO_ASSIGN_IP=false; shift ;;
         --region)      DEFAULT_REGION="$2"; shift 2 ;;
         --user-data)   USER_DATA="$2";     shift 2 ;;
         --no-ssh)      NO_SSH=true;        shift ;;
@@ -506,7 +518,7 @@ get_default_vpc() {
         --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
 
     if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
-        die "No default VPC found. Create one or specify a subnet."
+        die "No default VPC found. Specify one with --vpc or --subnet."
     fi
     echo "$vpc_id"
 }
@@ -598,6 +610,27 @@ launch_instance() {
         fi
     fi
 
+    # Build subnet argument
+    local subnet_flag=()
+    if [[ -n "$CUSTOM_SUBNET" ]]; then
+        subnet_flag=(--subnet-id "$CUSTOM_SUBNET")
+        info "Subnet: $CUSTOM_SUBNET"
+        # Auto-enable public IP for custom subnets (awsh needs it to connect)
+        if [[ "$AUTO_ASSIGN_IP" != false ]]; then
+            AUTO_ASSIGN_IP=true
+        fi
+    fi
+
+    # Build auto-assign public IP argument
+    local ip_flag=()
+    if [[ "$AUTO_ASSIGN_IP" == true ]]; then
+        ip_flag=(--associate-public-ip-address)
+        info "Auto-assign public IP: enabled"
+    elif [[ "$AUTO_ASSIGN_IP" == false ]]; then
+        ip_flag=(--no-associate-public-ip-address)
+        warn "Auto-assign public IP: disabled (instance may not get a public IP)"
+    fi
+
     local instance_id
     instance_id=$(aws ec2 run-instances "${REGION_FLAG[@]}" \
         --image-id "$ami" \
@@ -606,6 +639,8 @@ launch_instance() {
         --security-group-ids "$sg_id" \
         --count 1 \
         "${ud_flag[@]}" \
+        "${subnet_flag[@]}" \
+        "${ip_flag[@]}" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INST_NAME},{Key=CreatedBy,Value=awsh}]" \
         --query 'Instances[0].InstanceId' --output text)
 
@@ -621,18 +656,28 @@ launch_instance() {
         --instance-ids "$instance_id"
     success "Instance is running"
 
-    # Get public IP
-    local public_ip
+    # Get public and private IPs
+    local public_ip private_ip
     public_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
         --instance-ids "$instance_id" \
         --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+    private_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+        --instance-ids "$instance_id" \
+        --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
 
-    if [[ -z "$public_ip" || "$public_ip" == "None" ]]; then
-        die "Instance has no public IP. Check subnet/VPC settings."
+    [[ "$public_ip" == "None" ]] && public_ip=""
+    [[ "$private_ip" == "None" ]] && private_ip=""
+
+    if [[ -n "$public_ip" ]]; then
+        success "Public IP: $public_ip"
+    else
+        warn "No public IP assigned"
+    fi
+    if [[ -n "$private_ip" ]]; then
+        success "Private IP: $private_ip"
     fi
 
-    success "Public IP: $public_ip"
-    echo "$instance_id $public_ip"
+    echo "$instance_id $public_ip $private_ip"
 }
 
 # ─── Wait for SSH ────────────────────────────────────────────────────────────
@@ -718,14 +763,21 @@ print_summary() {
     local instance_id="$1"
     local public_ip="$2"
     local user="$3"
+    local private_ip="${4:-}"
     local key_file="${AWSH_DIR}/${KEY_NAME}.pem"
+    local connect_ip="${public_ip:-$private_ip}"
 
     echo
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}${BOLD}  Instance Ready!${NC}"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  Instance ID : ${CYAN}$instance_id${NC}"
-    echo -e "  Public IP   : ${CYAN}$public_ip${NC}"
+    if [[ -n "$public_ip" ]]; then
+        echo -e "  Public IP   : ${CYAN}$public_ip${NC}"
+    fi
+    if [[ -n "$private_ip" ]]; then
+        echo -e "  Private IP  : ${CYAN}$private_ip${NC}"
+    fi
     echo -e "  Image       : ${CYAN}$IMAGE${NC}"
     echo -e "  Type        : ${CYAN}$INSTANCE_TYPE${NC}"
 
@@ -751,13 +803,13 @@ print_summary() {
 
     if [[ "$IS_WINDOWS" == true ]]; then
         echo -e "  ${BOLD}RDP Command:${NC}"
-        echo -e "  ${YELLOW}xfreerdp3 /v:${public_ip} /u:Administrator /p:<password> /cert:tofu /dynamic-resolution +clipboard${NC}"
+        echo -e "  ${YELLOW}xfreerdp3 /v:${connect_ip} /u:Administrator /p:<password> /cert:tofu /dynamic-resolution +clipboard${NC}"
         echo
         echo -e "  ${BOLD}RDP File:${NC}"
         echo -e "  ${YELLOW}xfreerdp3 ${AWSH_DIR}/${INST_NAME}.rdp /p:<password>${NC}"
     else
         echo -e "  ${BOLD}SSH Command:${NC}"
-        echo -e "  ${YELLOW}ssh -o StrictHostKeyChecking=no -i $key_file ${user}@${public_ip}${NC}"
+        echo -e "  ${YELLOW}ssh -o StrictHostKeyChecking=no -i $key_file ${user}@${connect_ip}${NC}"
     fi
 
     echo
@@ -826,6 +878,9 @@ main() {
             echo "  No-SSH:        $NO_SSH"
         fi
         echo "  User Data:     ${USER_DATA:-none}"
+        echo "  VPC:           ${CUSTOM_VPC:-default}"
+        echo "  Subnet:        ${CUSTOM_SUBNET:-default}"
+        echo "  Auto-Assign IP: ${AUTO_ASSIGN_IP:-false}"
         exit 0
     fi
 
@@ -836,22 +891,38 @@ main() {
     setup_key
 
     local vpc_id
-    vpc_id=$(get_default_vpc)
-    info "Using default VPC: $vpc_id"
+    if [[ -n "$CUSTOM_SUBNET" ]]; then
+        # Resolve VPC from subnet
+        vpc_id=$(aws ec2 describe-subnets "${REGION_FLAG[@]}" \
+            --subnet-ids "$CUSTOM_SUBNET" \
+            --query 'Subnets[0].VpcId' --output text 2>/dev/null)
+        [[ -n "$vpc_id" && "$vpc_id" != "None" ]] || die "Could not resolve VPC for subnet: $CUSTOM_SUBNET"
+        info "Using VPC $vpc_id (from subnet $CUSTOM_SUBNET)"
+    elif [[ -n "$CUSTOM_VPC" ]]; then
+        vpc_id="$CUSTOM_VPC"
+        info "Using custom VPC: $vpc_id"
+    else
+        vpc_id=$(get_default_vpc)
+        info "Using default VPC: $vpc_id"
+    fi
 
     local sg_id
     sg_id=$(create_security_group "$vpc_id")
 
-    local launch_output instance_id public_ip
+    local launch_output instance_id public_ip private_ip
     launch_output=$(launch_instance "$sg_id" "$ami")
     instance_id=$(echo "$launch_output" | awk '{print $1}')
     public_ip=$(echo "$launch_output" | awk '{print $2}')
+    private_ip=$(echo "$launch_output" | awk '{print $3}')
 
     # Disable cleanup trap now that everything succeeded
     CLEANUP_ON_FAIL=false
     trap - ERR
 
-    print_summary "$instance_id" "$public_ip" "$SSH_USER"
+    # Determine the IP to use for connections
+    local connect_ip="${public_ip:-$private_ip}"
+
+    print_summary "$instance_id" "$public_ip" "$SSH_USER" "$private_ip"
 
     if [[ "$IS_WINDOWS" == true ]]; then
         # ── Windows: RDP flow ──
@@ -864,15 +935,21 @@ main() {
                 echo -e "  ${BOLD}Password:${NC} ${YELLOW}$password${NC}"
                 echo
                 echo -e "  ${BOLD}Connect with:${NC}"
-                echo -e "  ${YELLOW}xfreerdp3 /v:${public_ip} /u:Administrator /p:'${password}' /cert:tofu /dynamic-resolution +clipboard${NC}"
+                echo -e "  ${YELLOW}xfreerdp3 /v:${connect_ip} /u:Administrator /p:'${password}' /cert:tofu /dynamic-resolution +clipboard${NC}"
                 echo -e "  ${YELLOW}xfreerdp3 ${AWSH_DIR}/${INST_NAME}.rdp /p:'${password}'${NC}"
                 echo
-                generate_rdp_file "$public_ip" "$instance_id" > /dev/null
+                generate_rdp_file "$connect_ip" "$instance_id" > /dev/null
             else
                 warn "Password not available yet. Retrieve it later with:"
                 info "aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
             fi
             exit 0
+        fi
+
+        # Need a reachable IP to auto-connect
+        if [[ -z "$public_ip" ]]; then
+            warn "No public IP — cannot auto-connect RDP. Use --no-rdp to get connection info."
+            exit 1
         fi
 
         # Wait for password and connect
@@ -898,6 +975,11 @@ main() {
         if [[ "$NO_SSH" == true ]]; then
             info "Skipping SSH (--no-ssh). Use the command above to connect."
             exit 0
+        fi
+
+        # Need a reachable IP to auto-connect
+        if [[ -z "$public_ip" ]]; then
+            die "No public IP — cannot auto-connect SSH. Use --no-ssh to get connection info for private IP."
         fi
 
         # Wait and connect
