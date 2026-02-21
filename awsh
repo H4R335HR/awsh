@@ -1,0 +1,760 @@
+#!/usr/bin/env bash
+# awsh - AWS EC2 Quick Launch & SSH
+# Usage: awsh [-i image] [-p ports] [-t type] [-n name] [-k keyname]
+#              [--ip cidr] [--no-ssh] [--user-data file/script]
+#              [--region region] [--dry-run] [--terminate] [-h]
+
+set -euo pipefail
+
+# ─── Defaults ────────────────────────────────────────────────────────────────
+DEFAULT_IMAGE="ubuntu"
+DEFAULT_TYPE="t3.micro"
+DEFAULT_KEY_NAME="awsh-key"
+DEFAULT_NAME="awsh-instance"
+DEFAULT_REGION=""
+EXTRA_PORTS=""
+CUSTOM_IP=""
+NO_SSH=false
+DRY_RUN=false
+SSH_USER=""
+CLEANUP_ON_FAIL=true
+TERMINATE_MODE=false
+STATUS_MODE=false
+USER_DATA=""
+
+# ─── Color helpers ───────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()    { echo -e "${CYAN}[*]${NC} $*" >&2; }
+success() { echo -e "${GREEN}[✓]${NC} $*" >&2; }
+warn()    { echo -e "${YELLOW}[!]${NC} $*" >&2; }
+error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
+die()     { error "$*"; exit 1; }
+
+# ─── Usage ───────────────────────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+
+  awsh - AWS EC2 Quick Launch & SSH
+
+  USAGE
+    awsh [options]
+    awsh --status [--region REGION]
+    awsh --terminate [--region REGION]
+
+  OPTIONS
+    -i, --image IMAGE       AMI alias or full AMI ID (default: ubuntu)
+                            Aliases: amazon-linux, ubuntu, debian, rhel, suse
+    -t, --type TYPE         Instance type (default: t3.micro)
+    -p, --ports PORTS       Comma-separated extra ports to open (e.g. 80,443)
+    -n, --name NAME         Instance Name tag (default: awsh-instance)
+    -k, --key KEY           Key pair name to create/reuse (default: awsh-key)
+        --ip CIDR           Custom ingress IP/CIDR instead of auto-detect
+                            (e.g. 203.0.113.50/32 or 10.0.0.0/24)
+        --user-data VALUE   User data for instance bootstrap. Accepts:
+                            • A file path (e.g. ./setup.sh or /path/to/cloud-init.yaml)
+                            • An inline script string (e.g. '#!/bin/bash\napt update')
+        --region REGION     AWS region override
+        --no-ssh            Don't SSH; just print the SSH command
+        --status            Show all awsh-created resources
+        --terminate         Terminate all awsh-created instances & clean up
+        --dry-run           Show what would be done without executing
+    -h, --help              Show this help
+
+  EXAMPLES
+    awsh                            # Ubuntu, t3.micro, SSH
+    awsh -i amazon-linux            # Amazon Linux, t3.micro, SSH
+    awsh -i ubuntu -p 80,443        # Ubuntu + open ports 80 & 443
+    awsh -i ubuntu -t t3.small      # Ubuntu on t3.small
+    awsh -i ami-0abcdef1234567890   # Custom AMI ID
+    awsh --no-ssh -n my-server      # Create & print SSH command only
+    awsh --ip 10.0.0.0/8 -p 8080   # Custom ingress CIDR
+    awsh --user-data ./setup.sh     # Bootstrap with a script file
+    awsh --user-data '#!/bin/bash
+      apt update && apt install -y nginx'  # Inline user data
+    awsh --status                   # Show all awsh resources
+    awsh --terminate                # Clean up all awsh resources
+
+EOF
+    exit 0
+}
+
+# ─── Parse arguments ─────────────────────────────────────────────────────────
+IMAGE="$DEFAULT_IMAGE"
+INSTANCE_TYPE="$DEFAULT_TYPE"
+KEY_NAME="$DEFAULT_KEY_NAME"
+INST_NAME="$DEFAULT_NAME"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -i|--image)    IMAGE="$2";         shift 2 ;;
+        -t|--type)     INSTANCE_TYPE="$2"; shift 2 ;;
+        -p|--ports)    EXTRA_PORTS="$2";   shift 2 ;;
+        -n|--name)     INST_NAME="$2";     shift 2 ;;
+        -k|--key)      KEY_NAME="$2";      shift 2 ;;
+        --ip)          CUSTOM_IP="$2";     shift 2 ;;
+        --region)      DEFAULT_REGION="$2"; shift 2 ;;
+        --user-data)   USER_DATA="$2";     shift 2 ;;
+        --no-ssh)      NO_SSH=true;        shift ;;
+        --dry-run)     DRY_RUN=true;       shift ;;
+        --status)      STATUS_MODE=true;   shift ;;
+        --terminate)   TERMINATE_MODE=true; shift ;;
+        -h|--help)     usage ;;
+        *)             die "Unknown option: $1 (use -h for help)" ;;
+    esac
+done
+
+# ─── Region flag builder ─────────────────────────────────────────────────────
+REGION_FLAG=()
+if [[ -n "$DEFAULT_REGION" ]]; then
+    REGION_FLAG=(--region "$DEFAULT_REGION")
+fi
+
+# ─── Resolve AMI alias → SSM path or raw AMI ID ─────────────────────────────
+resolve_ami() {
+    local img="$1"
+
+    # If it's already an AMI ID, return as-is
+    if [[ "$img" =~ ^ami-[0-9a-f]+$ ]]; then
+        echo "$img"
+        return
+    fi
+
+    case "${img,,}" in
+        amazon-linux|al2023|amzn)
+            echo "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.12-x86_64" ;;
+        ubuntu|ubuntu24|ubuntu-24)
+            echo "resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id" ;;
+        ubuntu22)
+            echo "resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp3/ami-id" ;;
+        debian|debian12)
+            echo "resolve:ssm:/aws/service/debian/release/12/latest/amd64" ;;
+        rhel|rhel9)
+            # RHEL doesn't have a clean SSM path; we'll look it up
+            echo "RHEL_LOOKUP" ;;
+        suse|sles)
+            echo "resolve:ssm:/aws/service/suse/sles/15-sp5/x86_64/latest" ;;
+        *)
+            die "Unknown image alias: $img\nSupported: amazon-linux, ubuntu, ubuntu22, debian, rhel, suse (or pass ami-xxxxx)" ;;
+    esac
+}
+
+# Guess SSH user from image alias
+resolve_ssh_user() {
+    local img="$1"
+    if [[ "$img" =~ ^ami- ]]; then
+        echo "ec2-user"  # default guess for raw AMI
+        return
+    fi
+    case "${img,,}" in
+        amazon-linux|al2023|amzn)   echo "ec2-user" ;;
+        ubuntu*)                     echo "ubuntu" ;;
+        debian*)                     echo "admin" ;;
+        rhel*)                       echo "ec2-user" ;;
+        suse|sles)                   echo "ec2-user" ;;
+        *)                           echo "ec2-user" ;;
+    esac
+}
+
+# ─── Cleanup on failure ─────────────────────────────────────────────────────
+CREATED_INSTANCE_ID=""
+CREATED_SG_ID=""
+CREATED_KEY=false
+
+cleanup() {
+    if [[ "$CLEANUP_ON_FAIL" == true ]]; then
+        warn "Cleaning up after failure..."
+        if [[ -n "$CREATED_INSTANCE_ID" ]]; then
+            aws ec2 terminate-instances "${REGION_FLAG[@]}" \
+                --instance-ids "$CREATED_INSTANCE_ID" &>/dev/null || true
+            info "Terminated instance $CREATED_INSTANCE_ID"
+        fi
+        if [[ -n "$CREATED_SG_ID" ]]; then
+            # Wait a bit for instance to start terminating before deleting SG
+            sleep 2
+            aws ec2 delete-security-group "${REGION_FLAG[@]}" \
+                --group-id "$CREATED_SG_ID" &>/dev/null || true
+            info "Deleted security group $CREATED_SG_ID"
+        fi
+        if [[ "$CREATED_KEY" == true ]]; then
+            aws ec2 delete-key-pair "${REGION_FLAG[@]}" \
+                --key-name "$KEY_NAME" &>/dev/null || true
+            rm -f "${KEY_NAME}.pem"
+            info "Deleted key pair $KEY_NAME"
+        fi
+    fi
+}
+
+# ─── Show status of awsh resources ───────────────────────────────────────────
+status_awsh() {
+    echo >&2
+    echo -e "${BOLD}${CYAN}  ╔═══════════════════════════════╗${NC}" >&2
+    echo -e "${BOLD}${CYAN}  ║      awsh — Resource Status    ║${NC}" >&2
+    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════╝${NC}" >&2
+    echo >&2
+
+    # Validate credentials
+    info "Validating AWS credentials..."
+    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" &>/dev/null; then
+        die "AWS credentials invalid or not configured.\n    Run: aws configure"
+    fi
+
+    local region_display
+    region_display=$(aws configure get region ${REGION_FLAG[@]} 2>/dev/null || echo "default")
+    info "Region: ${region_display}"
+    echo >&2
+
+    # ── Instances ──
+    echo -e "${BOLD}  EC2 Instances${NC}" >&2
+    echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
+
+    local instance_lines
+    instance_lines=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+        --filters "Name=tag:CreatedBy,Values=awsh" \
+                  "Name=instance-state-name,Values=running,stopped,pending,stopping" \
+        --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,InstanceType,LaunchTime]' \
+        --output text 2>/dev/null)
+
+    if [[ -z "$instance_lines" ]]; then
+        echo -e "  ${YELLOW}No instances found${NC}" >&2
+    else
+        local count=0
+        while IFS=$'\t' read -r id name state ip itype launch; do
+            [[ -z "$id" ]] && continue
+            count=$((count + 1))
+            [[ "$ip" == "None" ]] && ip="no public IP"
+            [[ "$name" == "None" ]] && name="unnamed"
+            # Color the state
+            local state_color="$YELLOW"
+            [[ "$state" == "running" ]] && state_color="$GREEN"
+            [[ "$state" == "stopped" ]] && state_color="$RED"
+            echo -e "  ${CYAN}$id${NC}  $name  ($itype, ${state_color}$state${NC}, $ip)" >&2
+        done <<< "$instance_lines"
+        echo -e "  ${BOLD}Total: $count instance(s)${NC}" >&2
+    fi
+
+    echo >&2
+
+    # ── Security Groups ──
+    echo -e "${BOLD}  Security Groups${NC}" >&2
+    echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
+
+    local sg_lines
+    sg_lines=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+        --filters "Name=tag:CreatedBy,Values=awsh" \
+        --query 'SecurityGroups[].[GroupId,GroupName]' \
+        --output text 2>/dev/null)
+
+    if [[ -z "$sg_lines" || "$sg_lines" == "None" ]]; then
+        echo -e "  ${YELLOW}No security groups found${NC}" >&2
+    else
+        local sg_count=0
+        while IFS=$'\t' read -r sg_id sg_name; do
+            [[ -z "$sg_id" ]] && continue
+            sg_count=$((sg_count + 1))
+            echo -e "  ${CYAN}$sg_id${NC}  $sg_name" >&2
+        done <<< "$sg_lines"
+        echo -e "  ${BOLD}Total: $sg_count security group(s)${NC}" >&2
+    fi
+
+    echo >&2
+
+    # ── Key Pairs ──
+    echo -e "${BOLD}  Key Pairs${NC}" >&2
+    echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
+
+    local key_lines
+    key_lines=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
+        --filters "Name=key-name,Values=awsh-key*" \
+        --query 'KeyPairs[].[KeyName,CreateTime]' \
+        --output text 2>/dev/null)
+
+    if [[ -z "$key_lines" || "$key_lines" == "None" ]]; then
+        echo -e "  ${YELLOW}No key pairs found${NC}" >&2
+    else
+        local key_count=0
+        while IFS=$'\t' read -r kn created; do
+            [[ -z "$kn" ]] && continue
+            key_count=$((key_count + 1))
+            local pem_status="${RED}missing${NC}"
+            [[ -f "${kn}.pem" ]] && pem_status="${GREEN}present${NC}"
+            echo -e "  ${CYAN}$kn${NC}  (local .pem: $pem_status)" >&2
+        done <<< "$key_lines"
+        echo -e "  ${BOLD}Total: $key_count key pair(s)${NC}" >&2
+    fi
+
+    echo >&2
+    exit 0
+}
+
+# ─── Terminate all awsh resources ────────────────────────────────────────────
+terminate_awsh() {
+    echo >&2
+    echo -e "${BOLD}${CYAN}  ╔═══════════════════════════════╗${NC}" >&2
+    echo -e "${BOLD}${CYAN}  ║    awsh — Terminate & Cleanup  ║${NC}" >&2
+    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════╝${NC}" >&2
+    echo >&2
+
+    # Validate credentials
+    info "Validating AWS credentials..."
+    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" &>/dev/null; then
+        die "AWS credentials invalid or not configured.\n    Run: aws configure"
+    fi
+
+    # Find all awsh-created instances (running or stopped)
+    info "Searching for awsh-created instances..."
+    local instance_lines
+    instance_lines=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+        --filters "Name=tag:CreatedBy,Values=awsh" \
+                  "Name=instance-state-name,Values=running,stopped,pending" \
+        --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,InstanceType]' \
+        --output text 2>/dev/null)
+
+    if [[ -z "$instance_lines" ]]; then
+        info "No awsh instances found."
+    else
+        local ids=()
+
+        echo >&2
+        echo -e "${BOLD}  Found awsh instance(s):${NC}" >&2
+        echo -e "${BOLD}  ──────────────────────────────────────────${NC}" >&2
+
+        while IFS=$'\t' read -r id name state ip itype; do
+            [[ -z "$id" ]] && continue
+            ids+=("$id")
+            [[ "$ip" == "None" ]] && ip="no public IP"
+            echo -e "  ${CYAN}$id${NC}  ${name:-unnamed}  ($itype, $state, $ip)" >&2
+        done <<< "$instance_lines"
+
+        echo >&2
+
+        if [[ ${#ids[@]} -eq 0 ]]; then
+            info "No awsh instances to terminate."
+        else
+            # Confirm
+            read -r -p "  Terminate all ${#ids[@]} instance(s)? [y/N] " confirm
+            if [[ "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]]; then
+                info "Aborted."
+                exit 0
+            fi
+
+            # Terminate
+            info "Terminating instances..."
+            aws ec2 terminate-instances "${REGION_FLAG[@]}" \
+                --instance-ids "${ids[@]}" \
+                --query 'TerminatingInstances[].{ID:InstanceId,State:CurrentState.Name}' \
+                --output table >&2
+            success "Instances terminated"
+
+            # Wait briefly for instances to start shutting down
+            info "Waiting for instances to begin shutting down..."
+            sleep 5
+        fi
+    fi
+
+    # Find and delete awsh security groups
+    info "Searching for awsh security groups..."
+    local sg_ids
+    sg_ids=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+        --filters "Name=tag:CreatedBy,Values=awsh" \
+        --query 'SecurityGroups[].GroupId' --output text 2>/dev/null)
+
+    if [[ -n "$sg_ids" && "$sg_ids" != "None" ]]; then
+        for sg_id in $sg_ids; do
+            info "Deleting security group: $sg_id"
+            # Retry a few times — SG deletion can fail if instance isn't fully terminated
+            local retries=5
+            while [[ $retries -gt 0 ]]; do
+                if aws ec2 delete-security-group "${REGION_FLAG[@]}" \
+                     --group-id "$sg_id" &>/dev/null; then
+                    success "Deleted: $sg_id"
+                    break
+                fi
+                retries=$((retries - 1))
+                if [[ $retries -gt 0 ]]; then
+                    info "SG still in use, retrying in 10s... ($retries left)"
+                    sleep 10
+                else
+                    warn "Could not delete $sg_id — instance may still be terminating. Try again later."
+                fi
+            done
+        done
+    else
+        info "No awsh security groups found."
+    fi
+
+    # Find and delete awsh key pairs
+    info "Searching for awsh key pairs..."
+    local key_names
+    key_names=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
+        --filters "Name=key-name,Values=awsh-key*" \
+        --query 'KeyPairs[].KeyName' --output text 2>/dev/null)
+
+    if [[ -n "$key_names" && "$key_names" != "None" ]]; then
+        for kn in $key_names; do
+            info "Deleting key pair: $kn"
+            aws ec2 delete-key-pair "${REGION_FLAG[@]}" --key-name "$kn" &>/dev/null
+            rm -f "${kn}.pem"
+            success "Deleted: $kn (+ local .pem)"
+        done
+    else
+        info "No awsh key pairs found."
+    fi
+
+    echo >&2
+    success "Cleanup complete!"
+    echo >&2
+    exit 0
+}
+
+# ─── Preflight checks ───────────────────────────────────────────────────────
+preflight() {
+    info "Checking prerequisites..."
+
+    # AWS CLI
+    command -v aws &>/dev/null || die "aws-cli not found. Install it first."
+
+    # curl (for IP detection)
+    command -v curl &>/dev/null || die "curl not found. Needed for IP detection."
+
+    # ssh
+    command -v ssh &>/dev/null || die "ssh not found. Install OpenSSH client first."
+
+    # Validate credentials
+    info "Validating AWS credentials..."
+    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" &>/dev/null; then
+        die "AWS credentials invalid or not configured.\n    Run: aws configure"
+    fi
+
+    local identity
+    identity=$(aws sts get-caller-identity "${REGION_FLAG[@]}" --output json 2>/dev/null)
+    local account arn
+    account=$(echo "$identity" | grep -o '"Account": *"[^"]*"' | cut -d'"' -f4)
+    arn=$(echo "$identity" | grep -o '"Arn": *"[^"]*"' | cut -d'"' -f4)
+    success "Credentials valid — Account: ${account}, Identity: ${arn}"
+}
+
+# ─── Key pair management ────────────────────────────────────────────────────
+setup_key() {
+    local key_file="${KEY_NAME}.pem"
+
+    # Check if key pair exists in AWS
+    if aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
+         --key-names "$KEY_NAME" &>/dev/null 2>&1; then
+        if [[ -f "$key_file" ]]; then
+            success "Reusing existing key pair: $KEY_NAME ($key_file)"
+            chmod 400 "$key_file" 2>/dev/null || true
+            return
+        else
+            warn "Key '$KEY_NAME' exists in AWS but local .pem is missing"
+            info "Deleting old key and creating fresh one..."
+            aws ec2 delete-key-pair "${REGION_FLAG[@]}" --key-name "$KEY_NAME"
+        fi
+    fi
+
+    info "Creating key pair: $KEY_NAME"
+    aws ec2 create-key-pair "${REGION_FLAG[@]}" \
+        --key-name "$KEY_NAME" \
+        --query 'KeyMaterial' \
+        --output text > "$key_file"
+    chmod 400 "$key_file"
+    CREATED_KEY=true
+    success "Key pair created: $key_file"
+}
+
+# ─── Get default VPC ────────────────────────────────────────────────────────
+get_default_vpc() {
+    local vpc_id
+    vpc_id=$(aws ec2 describe-vpcs "${REGION_FLAG[@]}" \
+        --filters "Name=is-default,Values=true" \
+        --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
+
+    if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
+        die "No default VPC found. Create one or specify a subnet."
+    fi
+    echo "$vpc_id"
+}
+
+# ─── Create security group ──────────────────────────────────────────────────
+create_security_group() {
+    local vpc_id="$1"
+    local sg_name="awsh-sg-$(date +%s)"
+
+    info "Creating security group: $sg_name"
+    local sg_id
+    sg_id=$(aws ec2 create-security-group "${REGION_FLAG[@]}" \
+        --group-name "$sg_name" \
+        --description "awsh auto-created SG for $INST_NAME" \
+        --vpc-id "$vpc_id" \
+        --query 'GroupId' --output text)
+
+    CREATED_SG_ID="$sg_id"
+
+    # Tag it
+    aws ec2 create-tags "${REGION_FLAG[@]}" \
+        --resources "$sg_id" \
+        --tags Key=Name,Value="$sg_name" Key=CreatedBy,Value=awsh &>/dev/null || true
+
+    # Determine ingress IP
+    local my_cidr
+    if [[ -n "$CUSTOM_IP" ]]; then
+        my_cidr="$CUSTOM_IP"
+        # Append /32 if no CIDR notation
+        [[ "$my_cidr" == */* ]] || my_cidr="${my_cidr}/32"
+    else
+        info "Detecting public IP..."
+        local my_ip
+        my_ip=$(curl -s --max-time 5 checkip.amazonaws.com || die "Could not detect public IP")
+        my_cidr="${my_ip}/32"
+    fi
+
+    info "Ingress CIDR: $my_cidr"
+
+    # Open SSH (port 22)
+    info "Opening port 22 (SSH) for $my_cidr"
+    aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+        --group-id "$sg_id" \
+        --protocol tcp --port 22 --cidr "$my_cidr" &>/dev/null
+
+    # Open extra ports
+    if [[ -n "$EXTRA_PORTS" ]]; then
+        IFS=',' read -ra PORTS <<< "$EXTRA_PORTS"
+        for port in "${PORTS[@]}"; do
+            port=$(echo "$port" | xargs)  # trim whitespace
+            info "Opening port $port for $my_cidr"
+            aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+                --group-id "$sg_id" \
+                --protocol tcp --port "$port" --cidr "$my_cidr" &>/dev/null
+        done
+    fi
+
+    success "Security group ready: $sg_id"
+    echo "$sg_id"
+}
+
+# ─── Launch instance ────────────────────────────────────────────────────────
+launch_instance() {
+    local sg_id="$1"
+    local ami="$2"
+
+    info "Launching ${BOLD}$INSTANCE_TYPE${NC} instance (image: $IMAGE)..."
+
+    # Build user-data argument
+    local ud_flag=()
+    if [[ -n "$USER_DATA" ]]; then
+        if [[ -f "$USER_DATA" ]]; then
+            info "User data: file $USER_DATA"
+            ud_flag=(--user-data "file://$USER_DATA")
+        else
+            # Inline script — write to temp file so AWS CLI can read it
+            local ud_tmp
+            ud_tmp=$(mktemp /tmp/awsh-userdata.XXXXXX)
+            echo "$USER_DATA" > "$ud_tmp"
+            info "User data: inline script ($(wc -c < "$ud_tmp") bytes)"
+            ud_flag=(--user-data "file://$ud_tmp")
+        fi
+    fi
+
+    local instance_id
+    instance_id=$(aws ec2 run-instances "${REGION_FLAG[@]}" \
+        --image-id "$ami" \
+        --instance-type "$INSTANCE_TYPE" \
+        --key-name "$KEY_NAME" \
+        --security-group-ids "$sg_id" \
+        --count 1 \
+        "${ud_flag[@]}" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INST_NAME},{Key=CreatedBy,Value=awsh}]" \
+        --query 'Instances[0].InstanceId' --output text)
+
+    # Clean up temp file if we created one
+    [[ -n "${ud_tmp:-}" ]] && rm -f "$ud_tmp"
+
+    CREATED_INSTANCE_ID="$instance_id"
+    success "Instance launched: $instance_id"
+
+    # Wait for running state
+    info "Waiting for instance to be running..."
+    aws ec2 wait instance-running "${REGION_FLAG[@]}" \
+        --instance-ids "$instance_id"
+    success "Instance is running"
+
+    # Get public IP
+    local public_ip
+    public_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+        --instance-ids "$instance_id" \
+        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+    if [[ -z "$public_ip" || "$public_ip" == "None" ]]; then
+        die "Instance has no public IP. Check subnet/VPC settings."
+    fi
+
+    success "Public IP: $public_ip"
+    echo "$instance_id $public_ip"
+}
+
+# ─── Wait for SSH ────────────────────────────────────────────────────────────
+wait_for_ssh() {
+    local ip="$1"
+    local key_file="${KEY_NAME}.pem"
+    local user="$2"
+    local max_attempts=30
+    local attempt=0
+
+    info "Waiting for SSH to become available..."
+    while [[ $attempt -lt $max_attempts ]]; do
+        if ssh -o StrictHostKeyChecking=no \
+               -o UserKnownHostsFile=/dev/null \
+               -o ConnectTimeout=3 \
+               -o BatchMode=yes \
+               -i "$key_file" \
+               "${user}@${ip}" true &>/dev/null; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        printf "\r${CYAN}[*]${NC} Attempt %d/%d..." "$attempt" "$max_attempts"
+        sleep 3
+    done
+    echo
+    return 1
+}
+
+# ─── Print summary ──────────────────────────────────────────────────────────
+print_summary() {
+    local instance_id="$1"
+    local public_ip="$2"
+    local user="$3"
+    local key_file="${KEY_NAME}.pem"
+
+    echo
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}${BOLD}  Instance Ready!${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  Instance ID : ${CYAN}$instance_id${NC}"
+    echo -e "  Public IP   : ${CYAN}$public_ip${NC}"
+    echo -e "  Image       : ${CYAN}$IMAGE${NC}"
+    echo -e "  Type        : ${CYAN}$INSTANCE_TYPE${NC}"
+    echo -e "  SSH User    : ${CYAN}$user${NC}"
+    echo -e "  Key File    : ${CYAN}$key_file${NC}"
+    if [[ -n "$EXTRA_PORTS" ]]; then
+        echo -e "  Extra Ports : ${CYAN}$EXTRA_PORTS${NC}"
+    fi
+    if [[ -n "$USER_DATA" ]]; then
+        if [[ -f "$USER_DATA" ]]; then
+            echo -e "  User Data   : ${CYAN}$USER_DATA${NC} (file)"
+        else
+            echo -e "  User Data   : ${CYAN}inline script${NC}"
+        fi
+    fi
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+    echo -e "  ${BOLD}SSH Command:${NC}"
+    echo -e "  ${YELLOW}ssh -o StrictHostKeyChecking=no -i $key_file ${user}@${public_ip}${NC}"
+    echo
+    echo -e "  ${BOLD}Terminate:${NC}"
+    echo -e "  ${YELLOW}awsh --terminate${NC}  (all awsh instances)"
+    echo -e "  ${YELLOW}aws ec2 terminate-instances ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-ids $instance_id${NC}  (this one only)"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+    # Handle terminate mode before anything else
+    if [[ "$TERMINATE_MODE" == true ]]; then
+        terminate_awsh
+    fi
+
+    # Handle status mode
+    if [[ "$STATUS_MODE" == true ]]; then
+        status_awsh
+    fi
+
+    echo
+    echo -e "${BOLD}${CYAN}  ╔═══════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}  ║     awsh — EC2 Quick Launch   ║${NC}"
+    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════╝${NC}"
+    echo
+
+    # Resolve SSH user
+    SSH_USER=$(resolve_ssh_user "$IMAGE")
+
+    # Resolve AMI
+    local ami
+    ami=$(resolve_ami "$IMAGE")
+
+    # Handle RHEL special lookup
+    if [[ "$ami" == "RHEL_LOOKUP" ]]; then
+        info "Looking up latest RHEL 9 AMI..."
+        ami=$(aws ec2 describe-images "${REGION_FLAG[@]}" \
+            --owners 309956199498 \
+            --filters "Name=name,Values=RHEL-9.*x86_64*" "Name=state,Values=available" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
+        [[ -n "$ami" && "$ami" != "None" ]] || die "Could not find RHEL AMI"
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}[DRY RUN] Would execute:${NC}"
+        echo "  Image:         $IMAGE → $ami"
+        echo "  Instance Type: $INSTANCE_TYPE"
+        echo "  Key Name:      $KEY_NAME"
+        echo "  Instance Name: $INST_NAME"
+        echo "  Extra Ports:   ${EXTRA_PORTS:-none}"
+        echo "  Ingress IP:    ${CUSTOM_IP:-auto-detect}"
+        echo "  SSH User:      $SSH_USER"
+        echo "  User Data:     ${USER_DATA:-none}"
+        echo "  No-SSH:        $NO_SSH"
+        exit 0
+    fi
+
+    # Set trap for cleanup on failure
+    trap 'cleanup' ERR
+
+    preflight
+    setup_key
+
+    local vpc_id
+    vpc_id=$(get_default_vpc)
+    info "Using default VPC: $vpc_id"
+
+    local sg_id
+    sg_id=$(create_security_group "$vpc_id")
+
+    local launch_output instance_id public_ip
+    launch_output=$(launch_instance "$sg_id" "$ami")
+    instance_id=$(echo "$launch_output" | awk '{print $1}')
+    public_ip=$(echo "$launch_output" | awk '{print $2}')
+
+    # Disable cleanup trap now that everything succeeded
+    CLEANUP_ON_FAIL=false
+    trap - ERR
+
+    print_summary "$instance_id" "$public_ip" "$SSH_USER"
+
+    if [[ "$NO_SSH" == true ]]; then
+        info "Skipping SSH (--no-ssh). Use the command above to connect."
+        exit 0
+    fi
+
+    # Wait and connect
+    if wait_for_ssh "$public_ip" "$SSH_USER"; then
+        echo
+        success "SSH ready — connecting now..."
+        echo
+        exec ssh -o StrictHostKeyChecking=no \
+                 -o UserKnownHostsFile=/dev/null \
+                 -i "${KEY_NAME}.pem" \
+                 "${SSH_USER}@${public_ip}"
+    else
+        echo
+        warn "SSH not ready after retries. Instance may still be initializing."
+        info "Try manually: ssh -i ${KEY_NAME}.pem ${SSH_USER}@${public_ip}"
+        exit 1
+    fi
+}
+
+main
