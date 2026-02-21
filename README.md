@@ -21,12 +21,12 @@ Everything is tagged `CreatedBy=awsh` so you can clean up with `awsh --terminate
 ## Install
 
 ```bash
-curl -sL https://raw.githubusercontent.com/<your-username>/awsh/main/awsh -o awsh
+curl -sL https://raw.githubusercontent.com/H4R335HR/awsh/main/awsh -o awsh
 chmod +x awsh
 sudo mv awsh /usr/local/bin/
 ```
 
-Requires: `aws` CLI v2, `curl`, `ssh`
+Requires: `aws` CLI v2, `curl`, `ssh` in Linux Distro
 
 ## Usage
 
