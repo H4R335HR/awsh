@@ -55,6 +55,9 @@ awsh --terminate [--region REGION]
 | `-n, --name` | Instance Name tag | `awsh-instance` |
 | `-k, --key` | Key pair name | `awsh-key` |
 | `--ip` | Custom ingress CIDR | auto-detect |
+| `--vpc` | VPC to launch in | default VPC |
+| `--subnet` | Subnet to launch in (auto-resolves VPC) | — |
+| `--auto-assign-ip` | Auto-assign public IP (for non-default subnets) | — |
 | `--user-data` | Bootstrap script (file path or inline) | — |
 | `--region` | AWS region override | CLI default |
 | `--no-ssh` | Print SSH command instead of connecting (Linux) | — |
@@ -101,6 +104,15 @@ awsh -i windows --no-rdp
 
 # Bootstrap with a setup script
 awsh --user-data ./install-tools.sh
+
+# Launch in a custom subnet
+awsh --subnet subnet-0abc123def456
+
+# Custom subnet with auto-assigned public IP
+awsh --subnet subnet-0abc123def456 --auto-assign-ip
+
+# Specify a VPC (SG created there, uses its default subnet)
+awsh --vpc vpc-0abc123def456
 
 # Inline bootstrap
 awsh --user-data '#!/bin/bash
