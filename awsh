@@ -632,6 +632,7 @@ launch_instance() {
     fi
 
     local instance_id
+    local run_rc=0
     instance_id=$(aws ec2 run-instances "${REGION_FLAG[@]}" \
         --image-id "$ami" \
         --instance-type "$INSTANCE_TYPE" \
@@ -642,10 +643,16 @@ launch_instance() {
         "${subnet_flag[@]}" \
         "${ip_flag[@]}" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INST_NAME},{Key=CreatedBy,Value=awsh}]" \
-        --query 'Instances[0].InstanceId' --output text)
+        --query 'Instances[0].InstanceId' --output text) || run_rc=$?
 
     # Clean up temp file if we created one
     [[ -n "${ud_tmp:-}" ]] && rm -f "$ud_tmp"
+
+    # Check if launch succeeded
+    if [[ $run_rc -ne 0 || -z "$instance_id" || "$instance_id" == "None" ]]; then
+        error "Failed to launch instance (see error above)"
+        return 1
+    fi
 
     CREATED_INSTANCE_ID="$instance_id"
     success "Instance launched: $instance_id"
@@ -704,6 +711,102 @@ wait_for_ssh() {
     done
     echo
     return 1
+}
+
+# ─── Diagnose SSH failure ────────────────────────────────────────────────────
+diagnose_ssh_failure() {
+    local connect_ip="$1"
+    local sg_id="$2"
+    local instance_id="$3"
+    local user="$4"
+    local private_ip="${5:-}"
+
+    echo
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    echo -e "${YELLOW}${BOLD}  SSH Connection Diagnostics${NC}" >&2
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    echo >&2
+
+    # ── Check 1: IP vs Security Group ──
+    local current_ip
+    current_ip=$(curl -s --max-time 5 checkip.amazonaws.com 2>/dev/null)
+    local sg_cidrs
+    sg_cidrs=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+        --group-ids "$sg_id" \
+        --query 'SecurityGroups[0].IpPermissions[?FromPort==`22`].IpRanges[].CidrIp' \
+        --output text 2>/dev/null)
+
+    if [[ -n "$current_ip" && -n "$sg_cidrs" ]]; then
+        if echo "$sg_cidrs" | grep -q "$current_ip"; then
+            success "IP check: Your IP ($current_ip) matches SG rule ($sg_cidrs)"
+        else
+            error "IP mismatch! Your IP is $current_ip but SG allows: $sg_cidrs"
+            info "Your IP may have changed since launch. Re-run awsh or update the SG."
+            echo >&2
+            return
+        fi
+    else
+        warn "Could not verify IP/SG match"
+    fi
+
+    # ── Check 2: Instance health ──
+    local sys_status inst_status
+    sys_status=$(aws ec2 describe-instance-status "${REGION_FLAG[@]}" \
+        --instance-ids "$instance_id" \
+        --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null)
+    inst_status=$(aws ec2 describe-instance-status "${REGION_FLAG[@]}" \
+        --instance-ids "$instance_id" \
+        --query 'InstanceStatuses[0].InstanceStatus.Status' --output text 2>/dev/null)
+
+    if [[ "$sys_status" == "ok" && "$inst_status" == "ok" ]]; then
+        success "Instance health: All checks passed"
+    elif [[ "$sys_status" == "initializing" || "$inst_status" == "initializing" ]]; then
+        warn "Instance health: Still initializing (sshd may not be ready)"
+        info "Wait a minute and try: ssh -i ${AWSH_DIR}/${KEY_NAME}.pem ${user}@${connect_ip}"
+        echo >&2
+        return
+    else
+        warn "Instance health: system=$sys_status, instance=$inst_status"
+    fi
+
+    # ── Check 3: Outbound port 22 (test via github.com) ──
+    local ssh_test
+    ssh_test=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 -o BatchMode=yes git@github.com 2>&1 || true)
+
+    if echo "$ssh_test" | grep -qi "permission denied\|successfully authenticated"; then
+        success "Port 22 outbound: Working (verified against github.com)"
+        echo >&2
+        warn "Port 22 works to external hosts but not to this EC2 instance."
+        warn "A VPC-level Network Firewall or account-level restriction is likely"
+        warn "blocking inbound SSH. This is common in AWS lab/training accounts."
+    elif echo "$ssh_test" | grep -qi "timed out\|connection refused\|no route"; then
+        warn "Port 22 outbound: Blocked (github.com also unreachable on port 22)"
+        echo >&2
+        warn "Your ISP or local network appears to block outbound port 22."
+        info "Try connecting from a different network, or use AWS Console Connect."
+    else
+        warn "Port 22 outbound: Inconclusive"
+    fi
+
+    # ── Suggest alternatives ──
+    echo >&2
+    echo -e "${BOLD}  Alternative connection methods:${NC}" >&2
+    echo -e "  ${CYAN}1.${NC} AWS Console → EC2 → Instances → Select → ${YELLOW}Connect${NC} → EC2 Instance Connect" >&2
+    echo -e "  ${CYAN}2.${NC} AWS CloudShell (connect via private IP from inside AWS):" >&2
+    echo -e "     ${YELLOW}ssh -i /tmp/key ${user}@${private_ip:-<private-ip>}${NC}" >&2
+    echo -e "  ${CYAN}3.${NC} EC2 Instance Connect Endpoint:" >&2
+    local subnet_id
+    subnet_id=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+        --instance-ids "$instance_id" \
+        --query 'Reservations[0].Instances[0].SubnetId' --output text 2>/dev/null)
+    echo -e "     ${YELLOW}aws ec2 create-instance-connect-endpoint --subnet-id ${subnet_id:-<subnet>}${NC}" >&2
+    echo -e "     ${YELLOW}aws ec2-instance-connect ssh --instance-id $instance_id --os-user $user --connection-type eice${NC}" >&2
+    echo >&2
+    echo -e "  ${BOLD}Manual SSH:${NC}" >&2
+    echo -e "  ${YELLOW}ssh -i ${AWSH_DIR}/${KEY_NAME}.pem ${user}@${connect_ip}${NC}" >&2
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    echo >&2
 }
 
 # ─── Wait for Windows password ──────────────────────────────────────────────
@@ -910,10 +1013,20 @@ main() {
     sg_id=$(create_security_group "$vpc_id")
 
     local launch_output instance_id public_ip private_ip
-    launch_output=$(launch_instance "$sg_id" "$ami")
-    instance_id=$(echo "$launch_output" | awk '{print $1}')
-    public_ip=$(echo "$launch_output" | awk '{print $2}')
-    private_ip=$(echo "$launch_output" | awk '{print $3}')
+    if ! launch_output=$(launch_instance "$sg_id" "$ami"); then
+        cleanup
+        exit 1
+    fi
+    instance_id=$(echo "$launch_output" | tail -1 | awk '{print $1}')
+    public_ip=$(echo "$launch_output" | tail -1 | awk '{print $2}')
+    private_ip=$(echo "$launch_output" | tail -1 | awk '{print $3}')
+
+    # Verify instance ID was captured
+    if [[ -z "$instance_id" || "$instance_id" == "None" ]]; then
+        error "Failed to capture instance ID from launch output"
+        cleanup
+        exit 1
+    fi
 
     # Disable cleanup trap now that everything succeeded
     CLEANUP_ON_FAIL=false
@@ -993,8 +1106,8 @@ main() {
                      "${SSH_USER}@${public_ip}"
         else
             echo
-            warn "SSH not ready after retries. Instance may still be initializing."
-            info "Try manually: ssh -i ${AWSH_DIR}/${KEY_NAME}.pem ${SSH_USER}@${public_ip}"
+            warn "SSH not ready after retries."
+            diagnose_ssh_failure "$public_ip" "$sg_id" "$instance_id" "$SSH_USER" "$private_ip"
             exit 1
         fi
     fi
