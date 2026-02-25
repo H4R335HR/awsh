@@ -7,7 +7,7 @@ $ awsh -i ubuntu -p 80,443
 $ awsh -i windows
 ```
 
-Built for cybersecurity students and anyone who needs a quick throwaway box without clicking through the AWS console or running 6 CLI commands.
+Built for cybersecurity students and anyone who needs a quick throwaway box without clicking through the AWS console.
 
 ## What it does
 
@@ -22,14 +22,12 @@ Everything is tagged `CreatedBy=awsh` so you can clean up with `awsh --terminate
 
 ## Requirements
 
-- **Linux** (any distro) or **macOS** — this is a Bash script, not tested on Windows
+- **Linux** (any distro) or **macOS**
 - **AWS CLI v2** — [install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-- **curl** — for public IP detection via `checkip.amazonaws.com`
+- **curl** — for public IP detection
 - **ssh** — OpenSSH client (for Linux instances)
 - **xfreerdp3** — FreeRDP 3 client (for Windows instances) — e.g. `sudo apt install freerdp3-x11`
 - **openssl** — for decrypting the Windows admin password
-
-The script checks for all required dependencies at startup and exits with a clear error if anything is missing.
 
 ## Install
 
@@ -58,11 +56,12 @@ awsh --terminate [--region REGION]
 | `--vpc` | VPC to launch in | default VPC |
 | `--subnet` | Subnet to launch in (auto-resolves VPC) | — |
 | `--auto-assign-ip` | Auto-assign public IP (for non-default subnets) | — |
+| `--no-auto-assign` | Disable auto-assign public IP | — |
 | `--user-data` | Bootstrap script (file path or inline) | — |
 | `--region` | AWS region override | CLI default |
 | `--no-ssh` | Print SSH command instead of connecting (Linux) | — |
 | `--no-rdp` | Print RDP info instead of connecting (Windows) | — |
-| `--status` | Show all awsh-created resources | — |
+| `--status` | Show all awsh resources + quick connect menu | — |
 | `--terminate` | Terminate all awsh instances & clean up | — |
 | `--dry-run` | Preview without executing | — |
 
@@ -93,42 +92,33 @@ awsh -i amazon-linux -p 80,443
 # Bigger instance, custom name
 awsh -t t3.small -n pentest-lab
 
-# Windows Server 2016 — auto RDP via xfreerdp3
+# Windows Server — auto RDP via xfreerdp3
 awsh -i windows
-
-# Windows Server 2022 with extra ports
-awsh -i win2022 -p 80,443
-
-# Create Windows instance, print RDP info without connecting
-awsh -i windows --no-rdp
 
 # Bootstrap with a setup script
 awsh --user-data ./install-tools.sh
 
-# Launch in a custom subnet
-awsh --subnet subnet-0abc123def456
-
-# Custom subnet with auto-assigned public IP
-awsh --subnet subnet-0abc123def456 --auto-assign-ip
-
-# Specify a VPC (SG created there, uses its default subnet)
-awsh --vpc vpc-0abc123def456
-
-# Inline bootstrap
-awsh --user-data '#!/bin/bash
-apt update && apt install -y nmap nikto'
-
-# Just create it, don't SSH
+# Just create it, don't SSH — prints connection info
 awsh --no-ssh
 
-# See what's running
+# See all awsh resources (instances, IPs, ports, quick connect)
 awsh --status
 
 # Clean up everything
 awsh --terminate
 ```
 
-## How cleanup works
+### Status & Quick Connect
+
+`awsh --status` shows all awsh-created resources with full details:
+
+- **Instances** — public/private IPs, open ports, state
+- **Security groups** — IDs and names
+- **Key pairs** — with local `.pem` status
+
+Running instances with a valid local key get a **Quick Connect** prompt — press the instance number to SSH in directly.
+
+## Cleanup
 
 `awsh --terminate` finds all resources tagged `CreatedBy=awsh` and:
 
@@ -140,11 +130,110 @@ awsh --terminate
 ## Notes
 
 - Your public IP is auto-detected via `checkip.amazonaws.com`. Override with `--ip`.
-- **Linux:** The SSH user is auto-resolved from the image (`ubuntu`, `ec2-user`, `admin`).
-- **Windows:** The admin password is encrypted by AWS with your key pair. `awsh` decrypts it automatically using `openssl`. This takes 4-10 minutes after instance launch.
-- An `.rdp` file is saved to `~/.cache/awsh/<instance-name>.rdp` for future connections.
-- If the key pair exists in AWS and the local `.pem` is present, it's reused. If the `.pem` is missing, the key is recreated.
-- If anything fails mid-launch, the script automatically cleans up the instance, security group, and key pair it created.
+- **Linux:** SSH user is auto-resolved from the image (`ubuntu`, `ec2-user`, `admin`) and stored as an instance tag.
+- **Windows:** The admin password takes 4-10 minutes after launch. `awsh` decrypts it automatically.
+- If a key pair's `.pem` file is left behind from a crashed session (read-only), it is automatically cleaned up on the next run.
+- If anything fails mid-launch, the script cleans up the instance, security group, and key pair it created.
+- Data is stored in `~/.cache/awsh/` (key files, RDP files).
+
+---
+
+# simplab.py
+
+Automates Simplilearn CloudLabs credential extraction — login, discover lab, LTI launch, and extract cloud credentials (AWS/Azure/GCP) without touching a browser.
+
+## Requirements
+
+```bash
+pip install requests
+```
+
+## Setup
+
+Save your credentials once so you don't need to pass them every time:
+
+```bash
+python simplab.py --email you@example.com --password 'P@ss' --save-creds
+```
+
+This writes to `~/.cache/cloudlabs/config.json` (chmod 600, owner-only).
+
+You can also set a default region:
+
+```bash
+python simplab.py --email you@example.com --password 'P@ss' --region us-east-1 --save-creds
+```
+
+Or use environment variables instead:
+
+```bash
+export SIMPLILEARN_EMAIL="you@example.com"
+export SIMPLILEARN_PASSWORD="yourpass"
+```
+
+**Precedence:** CLI args > env vars > config file.
+
+## Usage
+
+```
+python simplab.py [options]
+```
+
+| Option | Description | Default |
+|---|---|---|
+| `--email` | Simplilearn email | config/env |
+| `--password` | Simplilearn password | config/env |
+| `--eid` | Course elearning ID | `2765` |
+| `--lab-index` | Which lab if multiple found | `0` |
+| `--configure [PROFILE]` | Configure AWS CLI with lab creds | `default` profile |
+| `--region` | Override AWS region for `--configure` | from API |
+| `--stop-lab` | Stop/terminate the running lab | — |
+| `--save-creds` | Save email/password/region to config file | — |
+| `--no-wait` | Don't wait for deployment | — |
+| `--timeout` | Deployment timeout in seconds | `300` |
+| `--odl-guid` | CloudLabs ODL GUID (skip login) | — |
+| `--attendee-guid` | CloudLabs Attendee GUID (skip login) | — |
+| `--user-id` | Override Simplilearn numeric user ID | — |
+| `--debug` | Save OAuth debug info to disk | — |
+
+## Examples
+
+```bash
+# Fetch credentials (uses saved email/password)
+python simplab.py
+
+# Fetch and configure AWS CLI (default profile)
+python simplab.py --configure
+
+# Fetch and configure a named profile
+python simplab.py --configure mylab
+
+# Override region when configuring
+python simplab.py --configure --region ap-south-1
+
+# Stop the running lab (uses saved session)
+python simplab.py --stop-lab
+
+# Skip login if you already have GUIDs
+python simplab.py --odl-guid 3f8790c7-... --attendee-guid 314bfefb-...
+```
+
+## How it works
+
+1. **Login** — authenticates to Simplilearn using email/password, gets a JWT session
+2. **Discover labs** — fetches available CloudLabs for the given course
+3. **LTI Launch** — performs an OAuth 1.0 HMAC-SHA1 signed handoff to CloudLabs
+4. **Extract GUIDs** — captures ODL and Attendee GUIDs from the redirect chain
+5. **Fetch credentials** — calls the CloudLabs API to get cloud platform credentials
+
+## Stored data
+
+| File | Purpose |
+|---|---|
+| `~/.cache/cloudlabs/config.json` | Saved email, password, region |
+| `~/.cache/cloudlabs/session.json` | Active lab session (for `--stop-lab`) |
+| `~/.cache/cloudlabs/lti_debug.txt` | Only on GUID extraction failure |
+| `~/.cache/cloudlabs/oauth_debug.txt` | Only with `--debug` |
 
 ## License
 
