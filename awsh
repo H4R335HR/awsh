@@ -250,28 +250,88 @@ status_awsh() {
     echo -e "${BOLD}  EC2 Instances${NC}" >&2
     echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
 
-    local instance_lines
-    instance_lines=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+    local instance_json
+    instance_json=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
         --filters "Name=tag:CreatedBy,Values=awsh" \
                   "Name=instance-state-name,Values=running,stopped,pending,stopping" \
-        --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,InstanceType,LaunchTime]' \
+        --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,PrivateIpAddress,InstanceType,KeyName,SecurityGroups[].GroupId|join(`,`,@),Tags[?Key==`SshUser`]|[0].Value]' \
         --output text 2>/dev/null)
 
-    if [[ -z "$instance_lines" ]]; then
+    # Arrays to store connectable instances for the interactive prompt
+    local -a conn_ids=() conn_ips=() conn_keys=() conn_users=() conn_ssh_users=()
+
+    if [[ -z "$instance_json" ]]; then
         echo -e "  ${YELLOW}No instances found${NC}" >&2
     else
         local count=0
-        while IFS=$'\t' read -r id name state ip itype launch; do
+        while IFS=$'\t' read -r id name state pub_ip priv_ip itype key_name sg_ids_csv ssh_user; do
             [[ -z "$id" ]] && continue
             count=$((count + 1))
-            [[ "$ip" == "None" ]] && ip="no public IP"
             [[ "$name" == "None" ]] && name="unnamed"
+            [[ "$ssh_user" == "None" || -z "$ssh_user" ]] && ssh_user="ec2-user"
+            [[ "$pub_ip" == "None" ]] && pub_ip=""
+            [[ "$priv_ip" == "None" ]] && priv_ip=""
+
             # Color the state
             local state_color="$YELLOW"
             [[ "$state" == "running" ]] && state_color="$GREEN"
             [[ "$state" == "stopped" ]] && state_color="$RED"
-            echo -e "  ${CYAN}$id${NC}  $name  ($itype, ${state_color}$state${NC}, $ip)" >&2
-        done <<< "$instance_lines"
+
+            echo >&2
+            echo -e "  ${BOLD}${CYAN}[$count]${NC} ${CYAN}$id${NC}  ${BOLD}$name${NC}  ($itype, ${state_color}$state${NC})" >&2
+            if [[ -n "$pub_ip" ]]; then
+                echo -e "      Public IP  : ${GREEN}$pub_ip${NC}" >&2
+            else
+                echo -e "      Public IP  : ${YELLOW}none${NC}" >&2
+            fi
+            if [[ -n "$priv_ip" ]]; then
+                echo -e "      Private IP : ${CYAN}$priv_ip${NC}" >&2
+            fi
+
+            # Fetch open ports from security groups
+            if [[ -n "$sg_ids_csv" && "$sg_ids_csv" != "None" ]]; then
+                local ports_list=""
+                IFS=',' read -ra sg_arr <<< "$sg_ids_csv"
+                for sg_id in "${sg_arr[@]}"; do
+                    local port_lines
+                    port_lines=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+                        --group-ids "$sg_id" \
+                        --query 'SecurityGroups[0].IpPermissions[].[IpProtocol,FromPort,ToPort,IpRanges[].CidrIp|join(`,`,@)]' \
+                        --output text 2>/dev/null)
+                    while IFS=$'\t' read -r proto from_port to_port cidrs; do
+                        [[ -z "$proto" ]] && continue
+                        [[ "$proto" == "-1" ]] && { ports_list="${ports_list}all-traffic "; continue; }
+                        if [[ "$from_port" == "$to_port" ]]; then
+                            ports_list="${ports_list}${from_port}/${proto} "
+                        else
+                            ports_list="${ports_list}${from_port}-${to_port}/${proto} "
+                        fi
+                    done <<< "$port_lines"
+                done
+                ports_list=$(echo "$ports_list" | xargs)  # trim
+                if [[ -n "$ports_list" ]]; then
+                    echo -e "      Ports      : ${YELLOW}$ports_list${NC}" >&2
+                else
+                    echo -e "      Ports      : ${YELLOW}none${NC}" >&2
+                fi
+            fi
+
+            # Track connectable instances (running + has an IP + has a key we can use)
+            if [[ "$state" == "running" ]]; then
+                local connect_ip="${pub_ip:-$priv_ip}"
+                if [[ -n "$connect_ip" && -n "$key_name" && "$key_name" != "None" ]]; then
+                    local key_file="${AWSH_DIR}/${key_name}.pem"
+                    if [[ -f "$key_file" ]]; then
+                        conn_ids+=("$id")
+                        conn_ips+=("$connect_ip")
+                        conn_keys+=("$key_file")
+                        conn_users+=("$count")  # store display number
+                        conn_ssh_users+=("$ssh_user")
+                    fi
+                fi
+            fi
+        done <<< "$instance_json"
+        echo >&2
         echo -e "  ${BOLD}Total: $count instance(s)${NC}" >&2
     fi
 
@@ -326,6 +386,38 @@ status_awsh() {
     fi
 
     echo >&2
+
+    # ── Interactive connect prompt ──
+    if [[ ${#conn_ids[@]} -gt 0 ]]; then
+        echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
+        echo -e "${BOLD}  Quick Connect${NC}" >&2
+        echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
+        for i in "${!conn_ids[@]}"; do
+            echo -e "  Press ${BOLD}${CYAN}${conn_users[$i]}${NC} to SSH into instance ${CYAN}${conn_ids[$i]}${NC} (${conn_ips[$i]})" >&2
+        done
+        echo -e "  Press ${BOLD}q${NC} or ${BOLD}Enter${NC} to quit" >&2
+        echo >&2
+
+        local choice
+        read -r -p "  > " choice
+        if [[ -n "$choice" && "$choice" != "q" ]]; then
+            # Find which connectable instance matches the number
+            for i in "${!conn_users[@]}"; do
+                if [[ "${conn_users[$i]}" == "$choice" ]]; then
+                    echo >&2
+                    info "Connecting to ${conn_ids[$i]} (${conn_ips[$i]})..."
+                    echo >&2
+                    exec ssh -o StrictHostKeyChecking=no \
+                             -o UserKnownHostsFile=/dev/null \
+                             -o LogLevel=ERROR \
+                             -i "${conn_keys[$i]}" \
+                             "${conn_ssh_users[$i]}@${conn_ips[$i]}"
+                fi
+            done
+            warn "Invalid choice: $choice"
+        fi
+    fi
+
     exit 0
 }
 
@@ -501,6 +593,8 @@ setup_key() {
     fi
 
     info "Creating key pair: $KEY_NAME"
+    # Remove any stale .pem left with read-only perms from a crashed session
+    rm -f "$key_file" 2>/dev/null || { chmod u+w "$key_file" 2>/dev/null && rm -f "$key_file"; }
     aws ec2 create-key-pair "${REGION_FLAG[@]}" \
         --key-name "$KEY_NAME" \
         --query 'KeyMaterial' \
@@ -642,7 +736,7 @@ launch_instance() {
         "${ud_flag[@]}" \
         "${subnet_flag[@]}" \
         "${ip_flag[@]}" \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INST_NAME},{Key=CreatedBy,Value=awsh}]" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INST_NAME},{Key=CreatedBy,Value=awsh},{Key=SshUser,Value=$SSH_USER}]" \
         --query 'Instances[0].InstanceId' --output text) || run_rc=$?
 
     # Clean up temp file if we created one
@@ -1102,6 +1196,7 @@ main() {
             echo
             exec ssh -o StrictHostKeyChecking=no \
                      -o UserKnownHostsFile=/dev/null \
+                     -o LogLevel=ERROR \
                      -i "${AWSH_DIR}/${KEY_NAME}.pem" \
                      "${SSH_USER}@${public_ip}"
         else
