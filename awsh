@@ -2,7 +2,7 @@
 # awsh - AWS EC2 Quick Launch & SSH/RDP
 # Usage: awsh [-i image] [-p ports] [-t type] [-n name] [-k keyname]
 #              [--ip cidr] [--no-ssh] [--no-rdp] [--user-data file/script]
-#              [--region region] [--dry-run] [--terminate] [-h]
+#              [--region region] [--profile profile] [--dry-run] [--terminate] [-h]
 
 set -euo pipefail
 
@@ -13,6 +13,7 @@ DEFAULT_TYPE="t3.micro"
 DEFAULT_KEY_NAME="awsh-key"
 DEFAULT_NAME="awsh-instance"
 DEFAULT_REGION=""
+AWS_PROFILE=""
 EXTRA_PORTS=""
 CUSTOM_IP=""
 CUSTOM_VPC=""
@@ -50,8 +51,8 @@ usage() {
 
   USAGE
     awsh [options]
-    awsh --status [--region REGION]
-    awsh --terminate [--region REGION]
+    awsh --status [--region REGION] [--profile PROFILE]
+    awsh --terminate [--region REGION] [--profile PROFILE]
 
   OPTIONS
     -i, --image IMAGE       AMI alias or full AMI ID (default: ubuntu)
@@ -70,6 +71,7 @@ usage() {
                             • A file path (e.g. ./setup.sh or /path/to/cloud-init.yaml)
                             • An inline script string (e.g. '#!/bin/bash\napt update')
         --region REGION     AWS region override
+        --profile PROFILE   AWS named profile to use (from ~/.aws/credentials)
         --no-ssh            Don't SSH; just print the SSH command (Linux)
         --no-rdp            Don't RDP; just print connection info (Windows)
         --status            Show all awsh-created resources
@@ -95,6 +97,7 @@ usage() {
       apt update && apt install -y nginx'  # Inline user data
     awsh --status                   # Show all awsh resources
     awsh --terminate                # Clean up all awsh resources
+    awsh --profile work             # Use the 'work' AWS profile
 
 EOF
     exit 0
@@ -119,6 +122,7 @@ while [[ $# -gt 0 ]]; do
         --auto-assign-ip) AUTO_ASSIGN_IP=true; shift ;;
         --no-auto-assign) AUTO_ASSIGN_IP=false; shift ;;
         --region)      DEFAULT_REGION="$2"; shift 2 ;;
+        --profile)     AWS_PROFILE="$2";    shift 2 ;;
         --user-data)   USER_DATA="$2";     shift 2 ;;
         --no-ssh)      NO_SSH=true;        shift ;;
         --no-rdp)      NO_RDP=true;        shift ;;
@@ -134,6 +138,12 @@ done
 REGION_FLAG=()
 if [[ -n "$DEFAULT_REGION" ]]; then
     REGION_FLAG=(--region "$DEFAULT_REGION")
+fi
+
+# ─── Profile flag builder ────────────────────────────────────────────────────
+PROFILE_FLAG=()
+if [[ -n "$AWS_PROFILE" ]]; then
+    PROFILE_FLAG=(--profile "$AWS_PROFILE")
 fi
 
 # ─── Resolve AMI alias → SSM path or raw AMI ID ─────────────────────────────
@@ -207,19 +217,19 @@ cleanup() {
     if [[ "$CLEANUP_ON_FAIL" == true ]]; then
         warn "Cleaning up after failure..."
         if [[ -n "$CREATED_INSTANCE_ID" ]]; then
-            aws ec2 terminate-instances "${REGION_FLAG[@]}" \
+            aws ec2 terminate-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                 --instance-ids "$CREATED_INSTANCE_ID" &>/dev/null || true
             info "Terminated instance $CREATED_INSTANCE_ID"
         fi
         if [[ -n "$CREATED_SG_ID" ]]; then
             # Wait a bit for instance to start terminating before deleting SG
             sleep 2
-            aws ec2 delete-security-group "${REGION_FLAG[@]}" \
+            aws ec2 delete-security-group "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                 --group-id "$CREATED_SG_ID" &>/dev/null || true
             info "Deleted security group $CREATED_SG_ID"
         fi
         if [[ "$CREATED_KEY" == true ]]; then
-            aws ec2 delete-key-pair "${REGION_FLAG[@]}" \
+            aws ec2 delete-key-pair "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                 --key-name "$KEY_NAME" &>/dev/null || true
             rm -f "${AWSH_DIR}/${KEY_NAME}.pem"
             info "Deleted key pair $KEY_NAME"
@@ -237,12 +247,12 @@ status_awsh() {
 
     # Validate credentials
     info "Validating AWS credentials..."
-    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" &>/dev/null; then
+    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" &>/dev/null; then
         die "AWS credentials invalid or not configured.\n    Run: aws configure"
     fi
 
     local region_display
-    region_display=$(aws configure get region ${REGION_FLAG[@]} 2>/dev/null || echo "default")
+    region_display=$(aws configure get region ${REGION_FLAG[@]} ${PROFILE_FLAG[@]} 2>/dev/null || echo "default")
     info "Region: ${region_display}"
     echo >&2
 
@@ -251,7 +261,7 @@ status_awsh() {
     echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
 
     local instance_json
-    instance_json=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+    instance_json=$(aws ec2 describe-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=tag:CreatedBy,Values=awsh" \
                   "Name=instance-state-name,Values=running,stopped,pending,stopping" \
         --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,PrivateIpAddress,InstanceType,KeyName,SecurityGroups[].GroupId|join(`,`,@),Tags[?Key==`SshUser`]|[0].Value]' \
@@ -294,7 +304,7 @@ status_awsh() {
                 IFS=',' read -ra sg_arr <<< "$sg_ids_csv"
                 for sg_id in "${sg_arr[@]}"; do
                     local port_lines
-                    port_lines=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+                    port_lines=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                         --group-ids "$sg_id" \
                         --query 'SecurityGroups[0].IpPermissions[].[IpProtocol,FromPort,ToPort,IpRanges[].CidrIp|join(`,`,@)]' \
                         --output text 2>/dev/null)
@@ -342,7 +352,7 @@ status_awsh() {
     echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
 
     local sg_lines
-    sg_lines=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+    sg_lines=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=tag:CreatedBy,Values=awsh" \
         --query 'SecurityGroups[].[GroupId,GroupName]' \
         --output text 2>/dev/null)
@@ -366,7 +376,7 @@ status_awsh() {
     echo -e "${BOLD}  ──────────────────────────────────────────────────────────────${NC}" >&2
 
     local key_lines
-    key_lines=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
+    key_lines=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=key-name,Values=awsh-key*" \
         --query 'KeyPairs[].[KeyName,CreateTime]' \
         --output text 2>/dev/null)
@@ -431,14 +441,14 @@ terminate_awsh() {
 
     # Validate credentials
     info "Validating AWS credentials..."
-    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" &>/dev/null; then
+    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" &>/dev/null; then
         die "AWS credentials invalid or not configured.\n    Run: aws configure"
     fi
 
     # Find all awsh-created instances (running or stopped)
     info "Searching for awsh-created instances..."
     local instance_lines
-    instance_lines=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+    instance_lines=$(aws ec2 describe-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=tag:CreatedBy,Values=awsh" \
                   "Name=instance-state-name,Values=running,stopped,pending" \
         --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value,State.Name,PublicIpAddress,InstanceType]' \
@@ -474,7 +484,7 @@ terminate_awsh() {
 
             # Terminate
             info "Terminating instances..."
-            aws ec2 terminate-instances "${REGION_FLAG[@]}" \
+            aws ec2 terminate-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                 --instance-ids "${ids[@]}" \
                 --query 'TerminatingInstances[].{ID:InstanceId,State:CurrentState.Name}' \
                 --output table >&2
@@ -489,7 +499,7 @@ terminate_awsh() {
     # Find and delete awsh security groups
     info "Searching for awsh security groups..."
     local sg_ids
-    sg_ids=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+    sg_ids=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=tag:CreatedBy,Values=awsh" \
         --query 'SecurityGroups[].GroupId' --output text 2>/dev/null)
 
@@ -499,7 +509,7 @@ terminate_awsh() {
             # Retry a few times — SG deletion can fail if instance isn't fully terminated
             local retries=5
             while [[ $retries -gt 0 ]]; do
-                if aws ec2 delete-security-group "${REGION_FLAG[@]}" \
+                if aws ec2 delete-security-group "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                      --group-id "$sg_id" &>/dev/null; then
                     success "Deleted: $sg_id"
                     break
@@ -520,14 +530,14 @@ terminate_awsh() {
     # Find and delete awsh key pairs
     info "Searching for awsh key pairs..."
     local key_names
-    key_names=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
+    key_names=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=key-name,Values=awsh-key*" \
         --query 'KeyPairs[].KeyName' --output text 2>/dev/null)
 
     if [[ -n "$key_names" && "$key_names" != "None" ]]; then
         for kn in $key_names; do
             info "Deleting key pair: $kn"
-            aws ec2 delete-key-pair "${REGION_FLAG[@]}" --key-name "$kn" &>/dev/null
+            aws ec2 delete-key-pair "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" --key-name "$kn" &>/dev/null
             rm -f "${AWSH_DIR}/${kn}.pem"
             success "Deleted: $kn (+ local .pem)"
         done
@@ -561,12 +571,12 @@ preflight() {
 
     # Validate credentials
     info "Validating AWS credentials..."
-    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" &>/dev/null; then
+    if ! aws sts get-caller-identity "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" &>/dev/null; then
         die "AWS credentials invalid or not configured.\n    Run: aws configure"
     fi
 
     local identity
-    identity=$(aws sts get-caller-identity "${REGION_FLAG[@]}" --output json 2>/dev/null)
+    identity=$(aws sts get-caller-identity "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" --output json 2>/dev/null)
     local account arn
     account=$(echo "$identity" | grep -o '"Account": *"[^"]*"' | cut -d'"' -f4)
     arn=$(echo "$identity" | grep -o '"Arn": *"[^"]*"' | cut -d'"' -f4)
@@ -579,7 +589,7 @@ setup_key() {
     local key_file="${AWSH_DIR}/${KEY_NAME}.pem"
 
     # Check if key pair exists in AWS
-    if aws ec2 describe-key-pairs "${REGION_FLAG[@]}" \
+    if aws ec2 describe-key-pairs "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
          --key-names "$KEY_NAME" &>/dev/null 2>&1; then
         if [[ -f "$key_file" ]]; then
             success "Reusing existing key pair: $KEY_NAME ($key_file)"
@@ -588,14 +598,14 @@ setup_key() {
         else
             warn "Key '$KEY_NAME' exists in AWS but local .pem is missing"
             info "Deleting old key and creating fresh one..."
-            aws ec2 delete-key-pair "${REGION_FLAG[@]}" --key-name "$KEY_NAME"
+            aws ec2 delete-key-pair "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" --key-name "$KEY_NAME"
         fi
     fi
 
     info "Creating key pair: $KEY_NAME"
     # Remove any stale .pem left with read-only perms from a crashed session
     rm -f "$key_file" 2>/dev/null || { chmod u+w "$key_file" 2>/dev/null && rm -f "$key_file"; }
-    aws ec2 create-key-pair "${REGION_FLAG[@]}" \
+    aws ec2 create-key-pair "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --key-name "$KEY_NAME" \
         --query 'KeyMaterial' \
         --output text > "$key_file"
@@ -607,7 +617,7 @@ setup_key() {
 # ─── Get default VPC ────────────────────────────────────────────────────────
 get_default_vpc() {
     local vpc_id
-    vpc_id=$(aws ec2 describe-vpcs "${REGION_FLAG[@]}" \
+    vpc_id=$(aws ec2 describe-vpcs "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --filters "Name=is-default,Values=true" \
         --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
 
@@ -624,7 +634,7 @@ create_security_group() {
 
     info "Creating security group: $sg_name"
     local sg_id
-    sg_id=$(aws ec2 create-security-group "${REGION_FLAG[@]}" \
+    sg_id=$(aws ec2 create-security-group "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --group-name "$sg_name" \
         --description "awsh auto-created SG for $INST_NAME" \
         --vpc-id "$vpc_id" \
@@ -633,7 +643,7 @@ create_security_group() {
     CREATED_SG_ID="$sg_id"
 
     # Tag it
-    aws ec2 create-tags "${REGION_FLAG[@]}" \
+    aws ec2 create-tags "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --resources "$sg_id" \
         --tags Key=Name,Value="$sg_name" Key=CreatedBy,Value=awsh &>/dev/null || true
 
@@ -655,12 +665,12 @@ create_security_group() {
     # Open SSH (port 22) or RDP (port 3389)
     if [[ "$IS_WINDOWS" == true ]]; then
         info "Opening port 3389 (RDP) for $my_cidr"
-        aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+        aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
             --group-id "$sg_id" \
             --protocol tcp --port 3389 --cidr "$my_cidr" &>/dev/null
     else
         info "Opening port 22 (SSH) for $my_cidr"
-        aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+        aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
             --group-id "$sg_id" \
             --protocol tcp --port 22 --cidr "$my_cidr" &>/dev/null
     fi
@@ -671,7 +681,7 @@ create_security_group() {
         for port in "${PORTS[@]}"; do
             port=$(echo "$port" | xargs)  # trim whitespace
             info "Opening port $port for $my_cidr"
-            aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" \
+            aws ec2 authorize-security-group-ingress "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
                 --group-id "$sg_id" \
                 --protocol tcp --port "$port" --cidr "$my_cidr" &>/dev/null
         done
@@ -727,7 +737,7 @@ launch_instance() {
 
     local instance_id
     local run_rc=0
-    instance_id=$(aws ec2 run-instances "${REGION_FLAG[@]}" \
+    instance_id=$(aws ec2 run-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --image-id "$ami" \
         --instance-type "$INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
@@ -753,16 +763,16 @@ launch_instance() {
 
     # Wait for running state
     info "Waiting for instance to be running..."
-    aws ec2 wait instance-running "${REGION_FLAG[@]}" \
+    aws ec2 wait instance-running "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --instance-ids "$instance_id"
     success "Instance is running"
 
     # Get public and private IPs
     local public_ip private_ip
-    public_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+    public_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --instance-ids "$instance_id" \
         --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-    private_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+    private_ip=$(aws ec2 describe-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --instance-ids "$instance_id" \
         --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
 
@@ -825,7 +835,7 @@ diagnose_ssh_failure() {
     local current_ip
     current_ip=$(curl -s --max-time 5 checkip.amazonaws.com 2>/dev/null)
     local sg_cidrs
-    sg_cidrs=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" \
+    sg_cidrs=$(aws ec2 describe-security-groups "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --group-ids "$sg_id" \
         --query 'SecurityGroups[0].IpPermissions[?FromPort==`22`].IpRanges[].CidrIp' \
         --output text 2>/dev/null)
@@ -845,10 +855,10 @@ diagnose_ssh_failure() {
 
     # ── Check 2: Instance health ──
     local sys_status inst_status
-    sys_status=$(aws ec2 describe-instance-status "${REGION_FLAG[@]}" \
+    sys_status=$(aws ec2 describe-instance-status "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --instance-ids "$instance_id" \
         --query 'InstanceStatuses[0].SystemStatus.Status' --output text 2>/dev/null)
-    inst_status=$(aws ec2 describe-instance-status "${REGION_FLAG[@]}" \
+    inst_status=$(aws ec2 describe-instance-status "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --instance-ids "$instance_id" \
         --query 'InstanceStatuses[0].InstanceStatus.Status' --output text 2>/dev/null)
 
@@ -891,7 +901,7 @@ diagnose_ssh_failure() {
     echo -e "     ${YELLOW}ssh -i /tmp/key ${user}@${private_ip:-<private-ip>}${NC}" >&2
     echo -e "  ${CYAN}3.${NC} EC2 Instance Connect Endpoint:" >&2
     local subnet_id
-    subnet_id=$(aws ec2 describe-instances "${REGION_FLAG[@]}" \
+    subnet_id=$(aws ec2 describe-instances "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
         --instance-ids "$instance_id" \
         --query 'Reservations[0].Instances[0].SubnetId' --output text 2>/dev/null)
     echo -e "     ${YELLOW}aws ec2 create-instance-connect-endpoint --subnet-id ${subnet_id:-<subnet>}${NC}" >&2
@@ -913,7 +923,7 @@ wait_for_password() {
     info "Waiting for Windows password (this can take 4-10 minutes)..."
     while [[ $attempt -lt $max_attempts ]]; do
         local encrypted
-        encrypted=$(aws ec2 get-password-data "${REGION_FLAG[@]}" \
+        encrypted=$(aws ec2 get-password-data "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
             --instance-id "$instance_id" \
             --query 'PasswordData' --output text 2>/dev/null)
 
@@ -1012,7 +1022,7 @@ print_summary() {
     echo
     echo -e "  ${BOLD}Terminate:${NC}"
     echo -e "  ${YELLOW}awsh --terminate${NC}  (all awsh instances)"
-    echo -e "  ${YELLOW}aws ec2 terminate-instances ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-ids $instance_id${NC}  (this one only)"
+    echo -e "  ${YELLOW}aws ec2 terminate-instances ${REGION_FLAG[*]:+${REGION_FLAG[*]} }${PROFILE_FLAG[*]:+${PROFILE_FLAG[*]} }--instance-ids $instance_id${NC}  (this one only)"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo
 }
@@ -1051,7 +1061,7 @@ main() {
     # Handle RHEL special lookup
     if [[ "$ami" == "RHEL_LOOKUP" ]]; then
         info "Looking up latest RHEL 9 AMI..."
-        ami=$(aws ec2 describe-images "${REGION_FLAG[@]}" \
+        ami=$(aws ec2 describe-images "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
             --owners 309956199498 \
             --filters "Name=name,Values=RHEL-9.*x86_64*" "Name=state,Values=available" \
             --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
@@ -1078,6 +1088,7 @@ main() {
         echo "  VPC:           ${CUSTOM_VPC:-default}"
         echo "  Subnet:        ${CUSTOM_SUBNET:-default}"
         echo "  Auto-Assign IP: ${AUTO_ASSIGN_IP:-false}"
+        echo "  Profile:       ${AWS_PROFILE:-default}"
         exit 0
     fi
 
@@ -1090,7 +1101,7 @@ main() {
     local vpc_id
     if [[ -n "$CUSTOM_SUBNET" ]]; then
         # Resolve VPC from subnet
-        vpc_id=$(aws ec2 describe-subnets "${REGION_FLAG[@]}" \
+        vpc_id=$(aws ec2 describe-subnets "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
             --subnet-ids "$CUSTOM_SUBNET" \
             --query 'Subnets[0].VpcId' --output text 2>/dev/null)
         [[ -n "$vpc_id" && "$vpc_id" != "None" ]] || die "Could not resolve VPC for subnet: $CUSTOM_SUBNET"
@@ -1148,7 +1159,7 @@ main() {
                 generate_rdp_file "$connect_ip" "$instance_id" > /dev/null
             else
                 warn "Password not available yet. Retrieve it later with:"
-                info "aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
+                info "aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }${PROFILE_FLAG[*]:+${PROFILE_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
             fi
             exit 0
         fi
@@ -1174,7 +1185,7 @@ main() {
         else
             echo
             warn "Password not available after retries. Instance may still be initializing."
-            info "Try later: aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
+            info "Try later: aws ec2 get-password-data ${REGION_FLAG[*]:+${REGION_FLAG[*]} }${PROFILE_FLAG[*]:+${PROFILE_FLAG[*]} }--instance-id $instance_id --priv-launch-key ${AWSH_DIR}/${KEY_NAME}.pem"
             exit 1
         fi
     else
