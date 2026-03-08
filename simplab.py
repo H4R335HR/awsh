@@ -43,6 +43,7 @@ CLOUDLABS_MANAGE = "https://manage.cloudlabs.ai"
 DEFAULT_EID = "2765"  # AWS Solutions Architect course
 CACHE_DIR = os.path.expanduser("~/.cache/cloudlabs")
 SESSION_FILE = os.path.join(CACHE_DIR, "session.json")
+COOKIE_CACHE_FILE = os.path.join(CACHE_DIR, "cookies.json")
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -675,6 +676,87 @@ def parse_and_display(lab_details, lab_info=None):
     return creds
 
 
+def show_lab_status(cloudlabs: CloudLabsClient, odl_guid: str, attendee_guid: str):
+    """Fetch and print the status of the lab, including time remaining."""
+    print("\n" + "=" * 62)
+    print("   📊  CLOUD LAB STATUS")
+    print("=" * 62)
+
+    try:
+        from datetime import datetime, timezone
+        
+        # 1. Basic deployment status
+        info = cloudlabs.get_attendee_status(attendee_guid)
+        status = info.get("DeploymentStatus", "Unknown")
+        
+        # If not started/failed, print early
+        if status.upper() not in ("SUCCEEDED", "RUNNING"):
+            print(f"\n   Status:     {status}")
+            print(f"\n{'=' * 62}\n")
+            return
+
+        # 2. Detailed info
+        lab_info = cloudlabs.get_odl_config(odl_guid)
+        lab_details = cloudlabs.get_lab_credentials(odl_guid, attendee_guid)
+
+        title = lab_info.get("Title") or lab_info.get("CustomTitle") or "N/A"
+        duration_mins = lab_details.get("Duration") or lab_info.get("Duration") or 0
+        start_time_str = lab_details.get("StartTime")
+
+        print(f"\n   Lab:        {title}")
+        print(f"   Status:     {status}  ✓")
+
+        if start_time_str and duration_mins:
+            print(f"   Started:    {start_time_str} UTC")
+            print(f"   Duration:   {duration_mins} min")
+
+            try:
+                # API format: 2026-03-08T11:43:08Z
+                # Replace 'Z' and any fractional seconds for clean parsing
+                clean_start = start_time_str.replace("Z", "").split(".")[0]
+                start_dt = datetime.fromisoformat(clean_start).replace(tzinfo=timezone.utc)
+                now_dt = datetime.now(timezone.utc)
+                
+                elapsed_sec = (now_dt - start_dt).total_seconds()
+                total_sec = int(duration_mins) * 60
+                rem_sec = total_sec - elapsed_sec
+                
+                if rem_sec > 0:
+                    hrm = int(rem_sec // 60)
+                    hrs = hrm // 60
+                    mins = hrm % 60
+                    rem_str = f"{hrs}h {mins}m" if hrs > 0 else f"{mins}m"
+                    print(f"   Remaining:  ~ {rem_str}")
+                else:
+                    print(f"   Remaining:  EXPIRED")
+            except Exception as dt_err:
+                print(f"   Remaining:  (Time calculation failed)")
+
+        # 3. Allocations / Platforms summary
+        allocations = lab_details.get("AllocatedTestDriveViewModalDetails", [])
+        if allocations:
+            platform_map = {1: "Azure", 2: "AWS", 3: "GCP"}
+            print("\n   [Resources]")
+            for alloc in allocations:
+                pid = alloc.get("CloudPlatformId")
+                plat = platform_map.get(pid, f"Unknown({pid})")
+                state = alloc.get("CurrentStatus", "Unknown")
+                
+                if pid == 2: # AWS
+                    acct = alloc.get("SubscriptionGuid", "N/A")
+                    print(f"   • {plat:6s} Account: {acct} ({state})")
+                elif pid == 1: # Azure
+                    sub = alloc.get("SubscriptionGuid", "N/A")
+                    print(f"   • {plat:6s} Sub ID:  {sub} ({state})")
+                else:
+                    print(f"   • {plat:6s} ({state})")
+
+    except Exception as e:
+        print(f"\n   [!] Error fetching status: {e}")
+
+    print(f"\n{'=' * 62}\n")
+
+
 # ──────────────────────────────────────────────
 # Session Persistence
 # ──────────────────────────────────────────────
@@ -716,6 +798,123 @@ def clear_session():
     if os.path.exists(SESSION_FILE):
         os.remove(SESSION_FILE)
         print(f"[+] Session file removed.")
+
+
+def save_cookie_cache(session, jwt_token, user_email, user_name, user_id, odl_guid, attendee_guid):
+    """Cache HTTP cookies + tokens + GUIDs so the next run can skip login."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    cookies = []
+    for c in session.cookies:
+        cookies.append({
+            "name": c.name,
+            "value": c.value,
+            "domain": c.domain,
+            "path": c.path,
+        })
+
+    cache = {
+        "cookies": cookies,
+        "jwt_token": jwt_token,
+        "user_email": user_email,
+        "user_name": user_name,
+        "user_id": user_id,
+        "odl_guid": odl_guid,
+        "attendee_guid": attendee_guid,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    with open(COOKIE_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+    os.chmod(COOKIE_CACHE_FILE, 0o600)
+    print(f"[+] Session cookies cached to {COOKIE_CACHE_FILE}")
+
+
+def load_cookie_cache():
+    """
+    Load cached cookies + GUIDs. Returns None if cache is missing,
+    corrupt, or the JWT has expired.
+    """
+    if not os.path.exists(COOKIE_CACHE_FILE):
+        return None
+
+    try:
+        with open(COOKIE_CACHE_FILE) as f:
+            cache = json.load(f)
+    except Exception as e:
+        print(f"[!] Cookie cache corrupt, ignoring: {e}")
+        return None
+
+    # Check JWT expiry
+    jwt_token = cache.get("jwt_token", "")
+    if jwt_token:
+        payload = decode_jwt_payload(jwt_token)
+        exp = payload.get("exp")
+        if exp and time.time() > exp:
+            print(f"[*] Cached session expired (JWT exp={time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(exp))})")
+            return None
+
+    # Require both GUIDs to be present
+    if not cache.get("odl_guid") or not cache.get("attendee_guid"):
+        return None
+
+    return cache
+
+
+def restore_session_from_cache(cache):
+    """
+    Rebuild a requests.Session from cached cookies.
+    Returns (session, odl_guid, attendee_guid) or None if validation fails.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    # Restore cookies
+    for c in cache.get("cookies", []):
+        session.cookies.set(
+            c["name"], c["value"],
+            domain=c.get("domain", ""),
+            path=c.get("path", "/"),
+        )
+
+    odl_guid = cache["odl_guid"]
+    attendee_guid = cache["attendee_guid"]
+
+    # Validate with a lightweight API call
+    try:
+        url = f"{CLOUDLABS_API_BASE}/AttendeeTestDrive/GetMultiCloudAttendeeTestDrive/{attendee_guid}"
+        resp = session.get(url, timeout=15)
+        if resp.status_code != 200:
+            print(f"[*] Cached session invalid (HTTP {resp.status_code}), performing fresh login...")
+            return None
+        data = resp.json()
+        status = data.get("DeploymentStatus", "")
+        if not status:
+            print(f"[*] Cached session returned empty status, performing fresh login...")
+            return None
+        print(f"[+] Reusing cached session (skipping login) — deployment: {status}")
+    except Exception as e:
+        print(f"[*] Cached session validation failed ({e}), performing fresh login...")
+        return None
+
+    return session, odl_guid, attendee_guid
+
+
+def clear_cookie_cache():
+    """Remove cookie cache file."""
+    removed = []
+    for f in [COOKIE_CACHE_FILE, SESSION_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
+            removed.append(os.path.basename(f))
+    if removed:
+        print(f"[+] Cleared: {', '.join(removed)}")
+    else:
+        print("[*] No cached sessions found.")
 
 
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
@@ -827,6 +1026,61 @@ def _update_ini_profile(filepath, profile, values):
 
 
 # ──────────────────────────────────────────────
+# Full Login Helper
+# ──────────────────────────────────────────────
+def _full_login(args):
+    """
+    Perform the complete Simplilearn login → lab discovery → LTI launch flow.
+    Returns (odl_guid, attendee_guid, CloudLabsClient).
+    Also caches the session cookies for future reuse.
+    """
+    # Save credentials if requested
+    if args.save_creds:
+        save_config(args.email, args.password, args.eid)
+        if args.region:
+            cfg = load_config()
+            cfg["region"] = args.region
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+
+    sl = SimplilearnSession()
+
+    if not sl.login(args.email, args.password):
+        sys.exit(1)
+
+    # Override user_id if provided via CLI
+    if args.user_id:
+        sl.user_id = args.user_id
+        print(f"    Using provided user_id: {sl.user_id}")
+
+    labs = sl.get_lab_list(args.eid)
+    if not labs:
+        sys.exit(1)
+
+    access_info = sl.access_lab(labs[args.lab_index], args.eid)
+    if not access_info:
+        sys.exit(1)
+
+    guids = sl.lti_launch(access_info, debug=args.debug)
+    odl_guid = guids.get("odl_guid")
+    attendee_guid = guids.get("attendee_guid")
+
+    if not odl_guid or not attendee_guid:
+        print("\n[!] Could not get both GUIDs. Check lti_debug.txt")
+        print("    Then re-run with: --odl-guid XXX --attendee-guid YYY")
+        sys.exit(1)
+
+    # Cache the session for future reuse
+    save_cookie_cache(
+        sl.session, sl.jwt_token, sl.user_email,
+        sl.user_name, sl.user_id, odl_guid, attendee_guid,
+    )
+
+    cloudlabs = CloudLabsClient(session=sl.session)
+    return odl_guid, attendee_guid, cloudlabs
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 def main():
@@ -872,6 +1126,8 @@ Examples:
                         help="Don't wait for deployment")
     parser.add_argument("--stop-lab", action="store_true",
                         help="Stop/terminate the running lab instead of fetching credentials")
+    parser.add_argument("--status", action="store_true",
+                        help="Show the status and time remaining of the running lab")
     parser.add_argument("--configure", nargs="?", const="default", default=None, metavar="PROFILE",
                         help="Configure AWS CLI with lab credentials (default profile: 'default')")
     parser.add_argument("--region", default=config.get("region"),
@@ -880,22 +1136,34 @@ Examples:
                         help="Deployment timeout seconds (default: 300)")
     parser.add_argument("--debug", action="store_true",
                         help="Save OAuth debug info to ~/.cache/cloudlabs/oauth_debug.txt")
+    parser.add_argument("--fresh", "--no-cache", action="store_true",
+                        help="Skip cached session and force a fresh login")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Clear all cached cookies/sessions and exit")
 
     args = parser.parse_args()
 
-    # ── Path 0: Load from session file (for --stop-lab without GUIDs) ──
-    if args.stop_lab and not args.odl_guid and not args.attendee_guid and not (args.email and args.password):
+    # ── Clear cache and exit if requested ──
+    if args.clear_cache:
+        clear_cookie_cache()
+        sys.exit(0)
+
+    # ── Path 0: Load from session file (for --stop-lab or --status without GUIDs) ──
+    if (args.stop_lab or args.status) and not args.odl_guid and not args.attendee_guid and not (args.email and args.password):
         session = load_session()
         if session:
             odl_guid = session["odl_guid"]
             attendee_guid = session["attendee_guid"]
             cloudlabs = CloudLabsClient()
-            print(f"\n[*] Stopping lab...")
-            print(f"      ODL:      {odl_guid}")
-            print(f"      Attendee: {attendee_guid}")
-            cloudlabs.stop_lab(odl_guid, attendee_guid)
-            clear_session()
-            print("[+] Done!")
+            if args.stop_lab:
+                print(f"\n[*] Stopping lab...")
+                print(f"      ODL:      {odl_guid}")
+                print(f"      Attendee: {attendee_guid}")
+                cloudlabs.stop_lab(odl_guid, attendee_guid)
+                clear_session()
+                print("[+] Done!")
+            elif args.status:
+                show_lab_status(cloudlabs, odl_guid, attendee_guid)
             sys.exit(0)
         else:
             print("[!] No saved session found. Provide --odl-guid + --attendee-guid, or --email + --password")
@@ -908,50 +1176,32 @@ Examples:
         attendee_guid = args.attendee_guid
         cloudlabs = CloudLabsClient()
 
-    # ── Path 2: Full automation ──
+    # ── Path 1.5: Reuse cached session (skip login if cookies still valid) ──
+    elif not args.fresh:
+        cache = load_cookie_cache()
+        restored = None
+        if cache:
+            restored = restore_session_from_cache(cache)
+
+        if restored:
+            cached_session, odl_guid, attendee_guid = restored
+            cloudlabs = CloudLabsClient(session=cached_session)
+        elif args.email and args.password:
+            # Cache miss/stale — fall through to full login
+            odl_guid, attendee_guid, cloudlabs = _full_login(args)
+        else:
+            parser.print_help()
+            print("\n[!] Need: --email + --password  OR  --odl-guid + --attendee-guid")
+            print("    Tip: run with --save-creds on first use, then just `python simp.py`")
+            sys.exit(1)
+
+    # ── Path 2: Full automation (--fresh or no cache available) ──
     elif args.email and args.password:
-        # Save credentials if requested
-        if args.save_creds:
-            save_config(args.email, args.password, args.eid)
-            # Also save region if provided
-            if args.region:
-                cfg = load_config()
-                cfg["region"] = args.region
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump(cfg, f, indent=2)
-
-        sl = SimplilearnSession()
-
-        if not sl.login(args.email, args.password):
-            sys.exit(1)
-
-        # Override user_id if provided via CLI
-        if args.user_id:
-            sl.user_id = args.user_id
-            print(f"    Using provided user_id: {sl.user_id}")
-
-        labs = sl.get_lab_list(args.eid)
-        if not labs:
-            sys.exit(1)
-
-        access_info = sl.access_lab(labs[args.lab_index], args.eid)
-        if not access_info:
-            sys.exit(1)
-
-        guids = sl.lti_launch(access_info, debug=args.debug)
-        odl_guid = guids.get("odl_guid")
-        attendee_guid = guids.get("attendee_guid")
-
-        if not odl_guid or not attendee_guid:
-            print("\n[!] Could not get both GUIDs. Check lti_debug.txt")
-            print("    Then re-run with: --odl-guid XXX --attendee-guid YYY")
-            sys.exit(1)
-
-        cloudlabs = CloudLabsClient(session=sl.session)
+        odl_guid, attendee_guid, cloudlabs = _full_login(args)
     else:
         parser.print_help()
         print("\n[!] Need: --email + --password  OR  --odl-guid + --attendee-guid")
-        print("    For --stop-lab: can also run standalone (reads saved session)")
+        print("    For --stop-lab / --status: can also run standalone (reads saved session)")
         sys.exit(1)
 
     # ── Stop lab if requested ──
@@ -962,6 +1212,11 @@ Examples:
         cloudlabs.stop_lab(odl_guid, attendee_guid)
         clear_session()
         print("[+] Done!")
+        sys.exit(0)
+
+    # ── Show status if requested ──
+    if args.status:
+        show_lab_status(cloudlabs, odl_guid, attendee_guid)
         sys.exit(0)
 
     # ── Fetch Credentials ──
@@ -1003,6 +1258,13 @@ Examples:
 
             # Save session for later --stop-lab
             save_session(odl_guid, attendee_guid, lab_details, creds)
+
+            # Update cookie cache with fresh GUIDs (in case we used cached session)
+            # This keeps the cache alive for longer
+            save_cookie_cache(
+                cloudlabs.session, "", "", "", "",
+                odl_guid, attendee_guid,
+            )
 
             # Configure AWS CLI if requested
             if args.configure is not None:
