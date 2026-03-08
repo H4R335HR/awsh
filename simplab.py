@@ -531,8 +531,8 @@ class CloudLabsClient:
             if status.upper() == "SUCCEEDED":
                 print("[+] Deployment ready!")
                 return True
-            elif status.upper() in ("FAILED", "ERROR", "CANCELLED"):
-                print(f"[!] Deployment failed: {status}")
+            elif status.upper() in ("FAILED", "ERROR", "CANCELLED", "DELETED", "EXPIRED"):
+                print(f"[!] Deployment failed or ended: {status}")
                 return False
 
             time.sleep(interval)
@@ -861,7 +861,7 @@ def load_cookie_cache():
     return cache
 
 
-def restore_session_from_cache(cache):
+def restore_session_from_cache(cache, require_active=True):
     """
     Rebuild a requests.Session from cached cookies.
     Returns (session, odl_guid, attendee_guid) or None if validation fails.
@@ -896,6 +896,11 @@ def restore_session_from_cache(cache):
         if not status:
             print(f"[*] Cached session returned empty status, performing fresh login...")
             return None
+            
+        if require_active and status.upper() in ("DELETED", "EXPIRED", "CANCELLED", "ENDED"):
+            print(f"[*] Cached session lab is {status}, performing fresh login...")
+            return None
+
         print(f"[+] Reusing cached session (skipping login) — deployment: {status}")
     except Exception as e:
         print(f"[*] Cached session validation failed ({e}), performing fresh login...")
@@ -1181,7 +1186,8 @@ Examples:
         cache = load_cookie_cache()
         restored = None
         if cache:
-            restored = restore_session_from_cache(cache)
+            require_active = not (args.status or args.stop_lab)
+            restored = restore_session_from_cache(cache, require_active=require_active)
 
         if restored:
             cached_session, odl_guid, attendee_guid = restored
