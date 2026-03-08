@@ -41,8 +41,8 @@ sudo mv awsh /usr/local/bin/
 
 ```
 awsh [options]
-awsh --status [--region REGION]
-awsh --terminate [--region REGION]
+awsh --status [--region REGION] [--profile PROFILE]
+awsh --terminate [--region REGION] [--profile PROFILE]
 ```
 
 | Option | Description | Default |
@@ -59,6 +59,7 @@ awsh --terminate [--region REGION]
 | `--no-auto-assign` | Disable auto-assign public IP | — |
 | `--user-data` | Bootstrap script (file path or inline) | — |
 | `--region` | AWS region override | CLI default |
+| `--profile` | AWS named profile to use (e.g. from ~/.aws/credentials) | — |
 | `--no-ssh` | Print SSH command instead of connecting (Linux) | — |
 | `--no-rdp` | Print RDP info instead of connecting (Windows) | — |
 | `--status` | Show all awsh resources + quick connect menu | — |
@@ -106,6 +107,10 @@ awsh --status
 
 # Clean up everything
 awsh --terminate
+
+# Do it using a specific AWS profile
+awsh -i ubuntu --profile mywork
+awsh --status --profile mywork
 ```
 
 ### Status & Quick Connect
@@ -188,9 +193,12 @@ python simplab.py [options]
 | `--configure [PROFILE]` | Configure AWS CLI with lab creds | `default` profile |
 | `--region` | Override AWS region for `--configure` | from API |
 | `--stop-lab` | Stop/terminate the running lab | — |
+| `--status` | Show the status and time remaining of the running lab | — |
 | `--save-creds` | Save email/password/region to config file | — |
 | `--no-wait` | Don't wait for deployment | — |
 | `--timeout` | Deployment timeout in seconds | `300` |
+| `--fresh` / `--no-cache`| Skip cached session and force a fresh login | — |
+| `--clear-cache` | Clear all cached cookies/sessions and exit | — |
 | `--odl-guid` | CloudLabs ODL GUID (skip login) | — |
 | `--attendee-guid` | CloudLabs Attendee GUID (skip login) | — |
 | `--user-id` | Override Simplilearn numeric user ID | — |
@@ -211,6 +219,9 @@ python simplab.py --configure mylab
 # Override region when configuring
 python simplab.py --configure --region ap-south-1
 
+# View the status and time remaining of the running lab (uses saved session)
+python simplab.py --status
+
 # Stop the running lab (uses saved session)
 python simplab.py --stop-lab
 
@@ -220,7 +231,7 @@ python simplab.py --odl-guid 3f8790c7-... --attendee-guid 314bfefb-...
 
 ## How it works
 
-1. **Login** — authenticates to Simplilearn using email/password, gets a JWT session
+1. **Login** — authenticates to Simplilearn using email/password, gets a JWT session. _(Cookies are cached automatically so subsequent runs skip this entire sequence and run instantly!)_
 2. **Discover labs** — fetches available CloudLabs for the given course
 3. **LTI Launch** — performs an OAuth 1.0 HMAC-SHA1 signed handoff to CloudLabs
 4. **Extract GUIDs** — captures ODL and Attendee GUIDs from the redirect chain
@@ -231,7 +242,8 @@ python simplab.py --odl-guid 3f8790c7-... --attendee-guid 314bfefb-...
 | File | Purpose |
 |---|---|
 | `~/.cache/cloudlabs/config.json` | Saved email, password, region |
-| `~/.cache/cloudlabs/session.json` | Active lab session (for `--stop-lab`) |
+| `~/.cache/cloudlabs/cookies.json` | Cached session to skip login on repeat runs |
+| `~/.cache/cloudlabs/session.json` | Active lab ID info (for `--stop-lab` or `--status`) |
 | `~/.cache/cloudlabs/lti_debug.txt` | Only on GUID extraction failure |
 | `~/.cache/cloudlabs/oauth_debug.txt` | Only with `--debug` |
 
