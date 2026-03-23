@@ -153,23 +153,57 @@ class SimplilearnSession:
         self.user_id = None
 
     def login(self, email, password):
-        """Step 1: POST /auth/login → get _sljt JWT cookie."""
+        """Step 1: GET login page (CSRF token) → POST /auth/login → get _sljt JWT cookie."""
         print(f"[1/5] Logging into Simplilearn as {email}...")
+
+        # First, GET the login page to obtain the _csrf token and session cookies
+        login_page_url = "https://accountsv2.simplilearn.com/"
+        page_resp = self.session.get(
+            login_page_url,
+            headers={"Referer": "https://www.simplilearn.com/"},
+            timeout=30,
+        )
+
+        # Extract _csrf token and any other hidden fields from the form
+        csrf_token = ""
+        hidden_fields = {}
+        for match in re.finditer(
+            r'<input[^>]+type=["\']hidden["\'][^>]*>', page_resp.text, re.IGNORECASE
+        ):
+            tag = match.group(0)
+            name_m = re.search(r'name=["\']([^"\']+)["\']', tag)
+            value_m = re.search(r'value=["\']([^"\']*)["\']', tag)
+            if name_m:
+                name = name_m.group(1)
+                value = value_m.group(1) if value_m else ""
+                hidden_fields[name] = value
+                if name == "_csrf":
+                    csrf_token = value
+
+        if csrf_token:
+            print(f"    CSRF token: {csrf_token[:12]}...")
+        else:
+            print("    [!] No _csrf token found on login page (may still work)")
+
+        post_data = {
+            "email": email,
+            "password": password,
+            "redirect_url": "https://lms.simplilearn.com",
+            "calendar_url": "",
+            "domainGid": "",
+            "isB2BAndB2C": "",
+            "domainUrl": "",
+        }
+        # Merge any hidden fields (including _csrf) into the POST data
+        post_data.update(hidden_fields)
 
         resp = self.session.post(
             SIMPLILEARN_LOGIN_URL,
-            data={
-                "email": email,
-                "password": password,
-                "redirect_url": "https://lms.simplilearn.com",
-                "calendar_url": "",
-                "domainGid": "",
-                "isB2BAndB2C": "",
-                "domainUrl": "",
-            },
+            data=post_data,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": "https://accountsv2.simplilearn.com",
+                "Referer": login_page_url,
             },
             allow_redirects=True,
             timeout=30,
@@ -861,10 +895,10 @@ def load_cookie_cache():
     return cache
 
 
-def restore_session_from_cache(cache, require_active=True):
+def restore_session_from_cache(cache):
     """
     Rebuild a requests.Session from cached cookies.
-    Returns (session, odl_guid, attendee_guid) or None if validation fails.
+    Returns (session, odl_guid, attendee_guid, status) or None if validation fails.
     """
     session = requests.Session()
     session.headers.update({
@@ -889,24 +923,18 @@ def restore_session_from_cache(cache, require_active=True):
         url = f"{CLOUDLABS_API_BASE}/AttendeeTestDrive/GetMultiCloudAttendeeTestDrive/{attendee_guid}"
         resp = session.get(url, timeout=15)
         if resp.status_code != 200:
-            print(f"[*] Cached session invalid (HTTP {resp.status_code}), performing fresh login...")
+            print(f"[*] Cached CloudLabs session invalid (HTTP {resp.status_code})")
             return None
         data = resp.json()
         status = data.get("DeploymentStatus", "")
         if not status:
-            print(f"[*] Cached session returned empty status, performing fresh login...")
+            print(f"[*] Cached CloudLabs session returned empty status")
             return None
             
-        if require_active and status.upper() in ("DELETED", "EXPIRED", "CANCELLED", "ENDED"):
-            print(f"[*] Cached session lab is {status}, performing fresh login...")
-            return None
-
-        print(f"[+] Reusing cached session (skipping login) — deployment: {status}")
+        return session, odl_guid, attendee_guid, status
     except Exception as e:
-        print(f"[*] Cached session validation failed ({e}), performing fresh login...")
+        print(f"[*] Cached CloudLabs session validation failed ({e})")
         return None
-
-    return session, odl_guid, attendee_guid
 
 
 def clear_cookie_cache():
@@ -1033,6 +1061,60 @@ def _update_ini_profile(filepath, profile, values):
 # ──────────────────────────────────────────────
 # Full Login Helper
 # ──────────────────────────────────────────────
+def _relaunch_lab(args, cache):
+    """
+    Skip login by reusing cached Simplilearn session, but request a fresh CloudLabs lab.
+    Returns (odl_guid, attendee_guid, CloudLabsClient) or None on failure.
+    """
+    print(f"\n[1/5] Reusing cached Simplilearn login for {cache.get('user_email', 'user')}...")
+    sl = SimplilearnSession()
+    
+    # Restore Simplilearn session
+    for c in cache.get("cookies", []):
+        sl.session.cookies.set(
+            c["name"], c["value"],
+            domain=c.get("domain", ""),
+            path=c.get("path", "/"),
+        )
+    sl.jwt_token = cache.get("jwt_token")
+    sl.user_email = cache.get("user_email")
+    sl.user_name = cache.get("user_name")
+    sl.user_id = cache.get("user_id")
+
+    if args.user_id:
+        sl.user_id = args.user_id
+        print(f"    Using provided user_id: {sl.user_id}")
+        
+    try:
+        labs = sl.get_lab_list(args.eid)
+        if not labs:
+            return None
+
+        access_info = sl.access_lab(labs[args.lab_index], args.eid)
+        if not access_info:
+            return None
+
+        guids = sl.lti_launch(access_info, debug=args.debug)
+        odl_guid = guids.get("odl_guid")
+        attendee_guid = guids.get("attendee_guid")
+
+        if not odl_guid or not attendee_guid:
+            print("\n[!] Could not get both GUIDs during relaunch.")
+            return None
+
+        # Cache the new session rules
+        save_cookie_cache(
+            sl.session, sl.jwt_token, sl.user_email,
+            sl.user_name, sl.user_id, odl_guid, attendee_guid,
+        )
+
+        cloudlabs = CloudLabsClient(session=sl.session)
+        return odl_guid, attendee_guid, cloudlabs
+    except Exception as e:
+        print(f"    [!] Relaunch failed: {e}")
+        return None
+
+
 def _full_login(args):
     """
     Perform the complete Simplilearn login → lab discovery → LTI launch flow.
@@ -1186,12 +1268,26 @@ Examples:
         cache = load_cookie_cache()
         restored = None
         if cache:
-            require_active = not (args.status or args.stop_lab)
-            restored = restore_session_from_cache(cache, require_active=require_active)
+            restored = restore_session_from_cache(cache)
 
         if restored:
-            cached_session, odl_guid, attendee_guid = restored
-            cloudlabs = CloudLabsClient(session=cached_session)
+            cached_session, odl_guid, attendee_guid, status = restored
+            require_active = not (args.status or args.stop_lab)
+            
+            if require_active and status.upper() in ("DELETED", "EXPIRED", "CANCELLED", "ENDED"):
+                print(f"[*] Cached CloudLabs session is {status}.")
+                relaunched = _relaunch_lab(args, cache)
+                if relaunched:
+                    odl_guid, attendee_guid, cloudlabs = relaunched
+                elif args.email and args.password:
+                    print("[*] Relaunch failed, falling back to full login...")
+                    odl_guid, attendee_guid, cloudlabs = _full_login(args)
+                else:
+                    print("\n[!] Relaunch failed. To perform full login, specify --email and --password.")
+                    sys.exit(1)
+            else:
+                print(f"[+] Reusing cached session (skipping login) — deployment: {status}")
+                cloudlabs = CloudLabsClient(session=cached_session)
         elif args.email and args.password:
             # Cache miss/stale — fall through to full login
             odl_guid, attendee_guid, cloudlabs = _full_login(args)
