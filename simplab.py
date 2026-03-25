@@ -834,7 +834,7 @@ def clear_session():
         print(f"[+] Session file removed.")
 
 
-def save_cookie_cache(session, jwt_token, user_email, user_name, user_id, odl_guid, attendee_guid):
+def save_cookie_cache(session, jwt_token, user_email, user_name, user_id, odl_guid, attendee_guid, deployment_expiry=None):
     """Cache HTTP cookies + tokens + GUIDs so the next run can skip login."""
     os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -847,6 +847,15 @@ def save_cookie_cache(session, jwt_token, user_email, user_name, user_id, odl_gu
             "path": c.path,
         })
 
+    # Preserve existing deployment_expiry if not provided
+    if deployment_expiry is None and os.path.exists(COOKIE_CACHE_FILE):
+        try:
+            with open(COOKIE_CACHE_FILE) as f:
+                old = json.load(f)
+            deployment_expiry = old.get("deployment_expiry")
+        except Exception:
+            pass
+
     cache = {
         "cookies": cookies,
         "jwt_token": jwt_token,
@@ -855,6 +864,7 @@ def save_cookie_cache(session, jwt_token, user_email, user_name, user_id, odl_gu
         "user_id": user_id,
         "odl_guid": odl_guid,
         "attendee_guid": attendee_guid,
+        "deployment_expiry": deployment_expiry,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -867,7 +877,7 @@ def save_cookie_cache(session, jwt_token, user_email, user_name, user_id, odl_gu
 def load_cookie_cache():
     """
     Load cached cookies + GUIDs. Returns None if cache is missing,
-    corrupt, or the JWT has expired.
+    corrupt, or the deployment / JWT has expired.
     """
     if not os.path.exists(COOKIE_CACHE_FILE):
         return None
@@ -887,6 +897,26 @@ def load_cookie_cache():
         if exp and time.time() > exp:
             print(f"[*] Cached session expired (JWT exp={time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(exp))})")
             return None
+
+    # Check deployment expiry (computed from start_time + duration)
+    dep_expiry = cache.get("deployment_expiry")
+    if dep_expiry:
+        try:
+            from datetime import datetime, timezone
+            exp_dt = datetime.fromisoformat(dep_expiry.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            if now_dt > exp_dt:
+                print(f"[*] Cached deployment expired ({dep_expiry}), skipping cache")
+                return None
+            else:
+                remaining = exp_dt - now_dt
+                mins_left = int(remaining.total_seconds() / 60)
+                hrs = mins_left // 60
+                mins = mins_left % 60
+                rem_str = f"{hrs}h {mins}m" if hrs > 0 else f"{mins}m"
+                print(f"[*] Cached deployment still valid (~{rem_str} remaining)")
+        except Exception:
+            pass  # can't parse — skip the check, validate via API
 
     # Require both GUIDs to be present
     if not cache.get("odl_guid") or not cache.get("attendee_guid"):
@@ -1361,11 +1391,24 @@ Examples:
             # Save session for later --stop-lab
             save_session(odl_guid, attendee_guid, lab_details, creds)
 
-            # Update cookie cache with fresh GUIDs (in case we used cached session)
-            # This keeps the cache alive for longer
+            # Compute deployment expiry from start_time + duration
+            dep_expiry = None
+            start_str = lab_details.get("StartTime")
+            dur_mins = lab_details.get("Duration")
+            if start_str and dur_mins:
+                try:
+                    from datetime import datetime, timezone, timedelta
+                    clean = start_str.replace("Z", "").split(".")[0]
+                    start_dt = datetime.fromisoformat(clean).replace(tzinfo=timezone.utc)
+                    dep_expiry = (start_dt + timedelta(minutes=int(dur_mins))).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    pass
+
+            # Update cookie cache with fresh GUIDs + expiry
             save_cookie_cache(
                 cloudlabs.session, "", "", "", "",
                 odl_guid, attendee_guid,
+                deployment_expiry=dep_expiry,
             )
 
             # Configure AWS CLI if requested
