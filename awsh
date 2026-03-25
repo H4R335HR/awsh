@@ -10,7 +10,8 @@ set -euo pipefail
 AWSH_DIR="$HOME/.cache/awsh"
 DEFAULT_IMAGE="ubuntu"
 DEFAULT_TYPE="t3.micro"
-DEFAULT_KEY_NAME="awsh-key"
+DEFAULT_KEY_NAME="awsh-default-key"
+CUSTOM_KEY=false
 DEFAULT_NAME="awsh-instance"
 DEFAULT_REGION=""
 AWS_PROFILE=""
@@ -61,7 +62,7 @@ usage() {
     -t, --type TYPE         Instance type (default: t3.micro)
     -p, --ports PORTS       Comma-separated extra ports to open (e.g. 80,443)
     -n, --name NAME         Instance Name tag (default: awsh-instance)
-    -k, --key KEY           Key pair name to create/reuse (default: awsh-key)
+    -k, --key KEY           Key pair name to create/reuse (default: awsh-<profile>-key)
         --ip CIDR           Custom ingress IP/CIDR instead of auto-detect
                             (e.g. 203.0.113.50/32 or 10.0.0.0/24)
         --vpc VPC_ID        VPC to launch in (default: default VPC)
@@ -115,7 +116,7 @@ while [[ $# -gt 0 ]]; do
         -t|--type)     INSTANCE_TYPE="$2"; shift 2 ;;
         -p|--ports)    EXTRA_PORTS="$2";   shift 2 ;;
         -n|--name)     INST_NAME="$2";     shift 2 ;;
-        -k|--key)      KEY_NAME="$2";      shift 2 ;;
+        -k|--key)      KEY_NAME="$2"; CUSTOM_KEY=true; shift 2 ;;
         --ip)          CUSTOM_IP="$2";     shift 2 ;;
         --vpc)         CUSTOM_VPC="$2";    shift 2 ;;
         --subnet)      CUSTOM_SUBNET="$2"; shift 2 ;;
@@ -144,6 +145,11 @@ fi
 PROFILE_FLAG=()
 if [[ -n "$AWS_PROFILE" ]]; then
     PROFILE_FLAG=(--profile "$AWS_PROFILE")
+fi
+
+# ─── Profile-aware key name ──────────────────────────────────────────────────
+if [[ "$CUSTOM_KEY" == false && -n "$AWS_PROFILE" ]]; then
+    KEY_NAME="awsh-${AWS_PROFILE}-key"
 fi
 
 # ─── Resolve AMI alias → SSM path or raw AMI ID ─────────────────────────────
@@ -377,7 +383,7 @@ status_awsh() {
 
     local key_lines
     key_lines=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
-        --filters "Name=key-name,Values=awsh-key*" \
+        --filters "Name=key-name,Values=awsh-*-key*" \
         --query 'KeyPairs[].[KeyName,CreateTime]' \
         --output text 2>/dev/null)
 
@@ -531,7 +537,7 @@ terminate_awsh() {
     info "Searching for awsh key pairs..."
     local key_names
     key_names=$(aws ec2 describe-key-pairs "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
-        --filters "Name=key-name,Values=awsh-key*" \
+        --filters "Name=key-name,Values=awsh-*-key*" \
         --query 'KeyPairs[].KeyName' --output text 2>/dev/null)
 
     if [[ -n "$key_names" && "$key_names" != "None" ]]; then
