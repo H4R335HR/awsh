@@ -569,7 +569,9 @@ preflight() {
 
     # Connection tool
     if [[ "$IS_WINDOWS" == true ]]; then
-        command -v xfreerdp3 &>/dev/null || die "xfreerdp3 not found. Install FreeRDP3 first.\n    e.g. sudo apt install freerdp3-x11"
+        if [[ "$NO_RDP" == false ]]; then
+            command -v xfreerdp3 &>/dev/null || die "xfreerdp3 not found. Install FreeRDP3 first.\n    e.g. sudo apt install freerdp3-x11"
+        fi
         command -v openssl &>/dev/null || die "openssl not found. Needed to decrypt Windows password."
     else
         command -v ssh &>/dev/null || die "ssh not found. Install OpenSSH client first."
