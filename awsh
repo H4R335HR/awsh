@@ -630,7 +630,19 @@ get_default_vpc() {
         --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
 
     if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
-        die "No default VPC found. Specify one with --vpc or --subnet."
+        warn "No default VPC found in this region."
+        read -r -p "  Create a default VPC? [y/N] " create_vpc
+        if [[ "${create_vpc,,}" == "y" || "${create_vpc,,}" == "yes" ]]; then
+            info "Creating default VPC..."
+            vpc_id=$(aws ec2 create-default-vpc "${REGION_FLAG[@]}" "${PROFILE_FLAG[@]}" \
+                --query 'Vpc.VpcId' --output text 2>&1) || die "Failed to create default VPC: $vpc_id"
+            if [[ -z "$vpc_id" || "$vpc_id" == "None" ]]; then
+                die "Failed to create default VPC."
+            fi
+            success "Default VPC created: $vpc_id"
+        else
+            die "No default VPC. Specify one with --vpc or --subnet, or allow creation."
+        fi
     fi
     echo "$vpc_id"
 }
